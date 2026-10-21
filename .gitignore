@@ -4,3 +4,8 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+.vscode/extensions.json
+.vscode/settings.json
+
+# WorkBuddy 本地工作数据（含记忆与临时文件，不应进仓库）
+.workbuddy/

@@ -11,6 +11,8 @@ ESP SmartMate 是基于 ESP8266 的家用遥控网关固件，面向 433MHz 固�
 - 433MHz 固定码学习、保存、发射、手动录入和闭环自检。
 - 红外学习和发射，空调品牌预设可通过编译开关按需启用。
 - 天猫精灵 AliGenie 和百度 DuerOS 多路插座接入。
+- Blinker App 手动点按（`btn-light1..3`）同样可触发 433 发射，与语音通道并存。
+- 定期上报 Blinker 云端握手状态（`MQTT_CONNECTED` / `MQTT_LOST`），便于分段排查。
 - 433 和红外各 6 个 slot，数据保存到 LittleFS。
 - 浏览器日志支持刷新和清除，日志时间使用 OLED 同一套已同步本地时间。
 - AliGenie 原始命令、解析结果、拒绝/异常路径和 433 发射耗时都有日志，便于判断语音命令是否真正到达设备。
@@ -159,6 +161,45 @@ build_flags =
 
 日志同时输出到串口和网页 `日志` 页面。网页日志支持手动刷新和清除。
 
+### 日志持久化（重启后可回查）
+
+日志会另存一份到 LittleFS，**重启或崩溃后仍能看到掉电前的记录**，这对排查
+偶发重启最有用。查看方式：日志页面点「已存盘」，或直接访问 `/logs/file`。
+
+写入策略是「RAM 攒批 + 定时追加」，不是每条都写 flash —— 那样既磨损 flash，
+又会在主循环里造成阻塞。具体行为：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| 落盘间隔 | 30 秒 | 攒够 30 秒或缓冲写满就追加一次 |
+| 单文件上限 | 32 KB | 写满后轮转为 `/log.1.txt`，只保留上一份 |
+| 常驻 RAM | 400 B | 待落盘缓冲 |
+| 文件系统占用 | ≤ 64 KB | 两个文件合计 |
+
+可在 `platformio.ini` 调整：
+
+```ini
+-DENABLE_LOG_PERSIST=1          ; 置 0 彻底关闭持久化，省 640 B RAM
+-DLOG_FLUSH_INTERVAL_MS=30000   ; 调小=崩溃前丢的日志更少，写入更频繁
+```
+
+每次启动会写入分隔行，并带上复位原因，例如：
+
+```text
+===== reboot =====
+00:00:01 Boot start chip=00A1B2C3 reset=Software Watchdog heap=41232
+```
+
+`reset=` 的取值可直接区分问题类型：`Power on`（掉电）、
+`Software Watchdog`（主循环被阻塞）、`Exception`（程序异常）、
+`External System`（软件调用 `ESP.restart()`）。
+
+> ⚠️ 两点限制：
+> 1. 缓冲未落盘的内容（最多 30 秒）会随崩溃丢失，这是为了避免频繁写 flash 的取舍。
+> 2. `uploadfs` 会重建整个文件系统，日志文件会一并清空。
+
+### AliGenie 排查
+
 AliGenie 相关日志示例：
 
 ```text
@@ -214,11 +255,47 @@ USB 上传：
 C:\Users\pyrrhus\.platformio\penv\Scripts\pio.exe run -t upload
 ```
 
+上传前端资源到文件系统（**首次烧录或改动 `data/` 下的 app.css / app.js 后必须执行**）：
+
+```powershell
+C:\Users\pyrrhus\.platformio\penv\Scripts\pio.exe run -t uploadfs
+```
+
+> ⚠️ `uploadfs` 会用 `data/` 目录重建整个 LittleFS 分区，可能清掉已学习的 433/红外码位。
+> 433 码位会从 EEPROM 自动恢复（见 `loadRfSlots()`），红外码位建议先记录。
+> 只改固件、不动前端资源时，用 `-t upload` 即可，不会触碰文件系统。
+
 串口监视：
 
 ```powershell
 C:\Users\pyrrhus\.platformio\penv\Scripts\pio.exe device monitor -b 115200
 ```
+
+## 内存与裁剪
+
+ESP8266 只有 80KB DRAM，且 `.rodata` 常量表也计入 RAM。当前占用：
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| RAM | 63.2%（51752 B） | **57.7%（47236 B）** |
+| Flash | 76.5%（799239 B） | **64.7%（676139 B）** |
+
+各项优化开关集中在 `platformio.ini` 的 `build_flags`，取值含义见文件顶部注释。
+完整测量数据与调优方法见 [`docs/memory-report.md`](docs/memory-report.md)。
+
+**红外协议裁剪**是 Flash 压缩的主要手段。IRremoteESP8266 默认编译 124 种协议，
+本项目通过 `-D_IR_ENABLE_DEFAULT_=false` 关闭全部，再按品牌逐个开启：
+
+| 界面品牌 | 协议宏 |
+|---|---|
+| 科龙 / 海信 | `KELON`、`KELON168` |
+| 大金 | `DAIKIN` + 各变体（2/64/128/152/160/176/200/216/312） |
+| 格力 | `GREE` |
+| 美的 / 华凌 / 小米 | `MIDEA`、`MIDEA24` |
+
+新增品牌时，在上表补对应 `DECODE_xxx` / `SEND_xxx` 即可。
+两个开关**不可关闭**：`SEND_RAW`（发送已学习的红外码）和
+`DECODE_HASH`（学习红外时的兜底解码器，关掉会学不到码）。
 
 ## Blinker AliGenie 原始命令日志
 
@@ -229,6 +306,134 @@ scripts/patch_blinker.py
 ```
 
 该脚本是幂等的，PlatformIO 每次编译会自动执行。如果 Blinker 依赖版本内部结构变化导致 hook 找不到，编译会直接报错，避免静默丢失诊断日志。
+
+## 语音链路分段排查
+
+语音控制不通时，按「天猫 → Blinker 云端 → 设备」三段依次确认，不要凭感觉改代码。
+固件已内置各段判定日志，配合串口监听即可定位断点。
+
+### 关键日志对照表
+
+| 日志 | 含义 |
+| --- | --- |
+| `Blinker link MQTT_LOST` / `MQTT_CONNECTED` | 设备与 Blinker 云端的握手状态，10 秒心跳 |
+| `MQTT Connected!` / `MQTT Ping!` | 库层 MQTT 握手成功与心跳 |
+| `AliGenie RAW #n {...}` | 收到天猫下发的原始报文 |
+| `RX any from=X data=...` | 全量下行报文捕获，不限协议，用来区分「云端没发」与「协议不匹配」 |
+| `AliGenie rejected RAW #n no callback` | 报文到了但没进回调（类型/字段不匹配） |
+| `AliGenie RX #n num=X state=Y` | AliGenie 解析成功并进入映射 |
+| `AliGenie num=0 fallback to 433 slot 1` | 天猫按单路下发，已按主灯位兜底 |
+| `Blinker data {"btn-light1":"on"}` | Blinker App 手动点按 |
+| `Blinker btn-light1 -> 433 slot 1` | App 点按已映射到 433 码位 |
+| `RF TX source=... slot=N` | 433 实际发射 |
+| `RF TX saved ... slot=N empty` | 该码位没有学习过 |
+
+**一条日志都没有 = 报文根本没到设备**，此时不要怀疑映射逻辑。
+
+### 两条独立的指令通道
+
+固件同时支持两条通道，互不冲突：
+
+1. **天猫 AliGenie**：字段 `pState` + `num`，由 Blinker 库 `aliParse()` 分发到
+   `aligeniePowerState()`。映射 1-3 → 433，4-6 → 红外。
+2. **Blinker App 手动点按**：字段 `btn-lightN`，走 `attachData` 回调，
+   由 `blinkerDataRead()` 解析 `btn-light1..3` 后发射 433。
+
+排查时先确认走的是哪一条：App 点按会打印 `Blinker data`，
+天猫语音会打印 `AliGenie RAW`。两者都没有就是云端未下发。
+
+### 常见故障与处理
+
+| 现象 | 可能原因 | 处理 |
+| --- | --- | --- |
+| 改名后语音完全无响应 | 设备名不含品类词，天猫无法匹配 | 改成含「灯/插座/插孔」的名字，并重新同步 |
+| App 点按无反应 | 组件名不是 `btn-lightN` | 看日志里的真实 key，再补映射 |
+| 只有 `MQTT Ping` 没有业务日志 | 设备在线，但云端没转发指令 | 重新绑定/同步平台账号 |
+| `invalid num=X` | 天猫设备类型与固件注册类型不符 | 检查是否误改 `BLINKER_ALIGENIE_MULTI_OUTLET` |
+| 反复 `MQTT_LOST` | 网络不稳或密钥失效 | 看 auth 是否已配置，必要时重新配密钥 |
+
+### 串口取证方法
+
+设备 IP 不在同网段时，只能靠串口。先开监听再让用户操作：
+
+```bash
+# 复位并抓启动日志
+pio device monitor -p COM3 -b 115200
+```
+
+复位时翻转 DTR/RTS（`rts=True` 拉低 EN）。启动后可从日志直接读出设备 IP，
+再用 `http://<ip>/logs` 查看历史环形日志（容量 40 行，会被冲刷，重要日志要及时抓）。
+
+开启 Blinker 库调试可看到完整 MQTT 握手，注意 `BLINKER_DEBUG` 是库内**全局对象**
+（`BlinkerDebug.cpp:42`），不能通过 `-D` 定义，只在代码里调用：
+
+```cpp
+BLINKER_DEBUG.stream(Serial);   // 默认级别
+// BLINKER_DEBUG.debugAll();    // 全量，输出量大慎用
+```
+
+`scripts/patch_blinker.py` 注入了两个钩子，编译时自动生效：
+
+- `blinkerInboundAliGenie()` / `blinkerInboundAliGenieParsed()`：包住 `aliParse()`，
+  记录天猫原始报文并判断是否进入回调。
+- `blinkerInboundAny()`：注入 `BlinkerPROESP.h` 的 `parseData()` 入口，
+  **无条件记录所有下行报文**。因为 `aliParse()` 受 `checkAliAvail()` 门控，
+  平台未按 AliGenie 协议下发时钩子看不到东西；这个钩子能区分
+  「云端根本没发」和「发了但协议不匹配」。
+
+## 接入其他语音平台
+
+天猫精灵与 Blinker 账号关联自 2024 年起仅对高级会员开放，若关联失效导致
+语音不通，可改用 HassLife + Home Assistant 绕过：
+
+```text
+GET http://esp8266-433.local/send?slot=1&state=on     # 触发 433 码位 1
+GET http://esp8266-433.local/rf-state                # 读取各码位状态
+GET http://esp8266-433.local/ir-send?slot=1          # 触发红外码位 1
+```
+
+设备启用了 mDNS，主机名 **`esp8266-433.local`**，路由器重新分配 IP 也不用改配置。
+若环境解析不了 `.local`（Docker 容器常见），可退回用 `http://192.168.71.4`。
+
+完整步骤见 [`docs/hasslife-integration.md`](docs/hasslife-integration.md)。
+Home Assistant 的 REST 配置方法见 [`docs/home-assistant-rest.md`](docs/home-assistant-rest.md)。
+
+### 综合面板（设备 + 代理节点）
+
+在树莓派 / Orange Pi 上跑一个轻量反代，把 HA 设备数据和 mihomo 代理节点
+合并到同一个网页，并顺带解决两个限制：
+
+- HA 的 REST API 不返回 `Access-Control-Allow-Origin`，浏览器跨域会被拦
+- mihomo 启用 `secret` 后，UI 页面拿不到 `Authorization` 头
+
+```
+浏览器 → :8090 panel-proxy
+           ├─ /ha/*     → HA 8123（服务端注入令牌）
+           ├─ /mihomo/* → mihomo 9090（服务端注入 secret）
+           └─ /         → 面板页面
+```
+
+面板上可看到空调实时功率 / 今日 / 本周 / 本月 / 本年电量，
+并可直接点开关控制 433 吸顶灯。详见 [`docs/panel.md`](docs/panel.md)。
+
+| 文件 | 说明 |
+| --- | --- |
+| [`scripts/panel_proxy.py`](scripts/panel_proxy.py) | 反代服务（纯标准库） |
+| [`scripts/panel-proxy.service`](scripts/panel-proxy.service) | systemd 单元 |
+| [`mihomo-node-ui.html`](mihomo-node-ui.html) | 面板页面（双入口自适应） |
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /send?slot=N&state=on\|off` | 发射第 N 个 433 码位并记录请求状态 |
+| `GET /rf-state` | 返回各码位状态 JSON，供外部集成回读 |
+| `GET /ir-send?slot=N` | 发射第 N 个红外码位 |
+| `GET /logs` | 查看运行日志 |
+| `GET /rf-status` | 查询 433 学习状态 |
+
+> 接口执行后返回 `302` 重定向到 `/#rf`，用 `urllib` 调试会看到 `HTTPError 404`，
+> 这是重定向导致的**假报错**，实际已发射，以日志 `RF TX source=HTTP` 为准。
+> 另注意 433 固定码无法回读灯具真实状态，`/rf-state` 是「最后一次请求的状态」，
+> 开和关发的是同一个码；需要真实状态回读请改用继电器方案。
 
 ## 注意事项
 

@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>代理组与节点 · 设备</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --line: #e3e6ea;
+    --text: #1f2328; --sub: #656d76; --blue: #0969da;
+    --green: #1a7f37; --red: #cf222e; --hover: #f0f3f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --card: #161b22; --line: #30363d;
+      --text: #e6edf3; --sub: #8b949e; --blue: #4493f8;
+      --green: #3fb950; --red: #f85149; --hover: #1c2128;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    padding: 16px 20px; background: var(--card);
+    border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+  }
+  h1 { margin: 0 0 4px; font-size: 18px; }
+  .sub { color: var(--sub); font-size: 12px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  button {
+    padding: 6px 14px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--card); color: var(--text); cursor: pointer; font-size: 13px;
+  }
+  button:hover { background: var(--hover); }
+  button.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  select {
+    padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--card); color: var(--text); font-size: 13px;
+  }
+  main { padding: 20px; max-width: 900px; margin: 0 auto; }
+  .group { margin-bottom: 28px; }
+  .group-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px; flex-wrap: wrap; gap: 8px;
+  }
+  .group-name { font-size: 15px; font-weight: 600; }
+  .badge {
+    padding: 2px 8px; border-radius: 10px; font-size: 11px;
+    background: var(--blue); color: #fff;
+  }
+  .grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .node {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; padding: 11px 13px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 7px; cursor: pointer;
+    transition: border-color .12s, background .12s;
+  }
+  .node:hover { background: var(--hover); }
+  .node.active { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue) inset; }
+  .node-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .node.active .node-name { font-weight: 600; }
+  /* 组条目：可点进去的下级策略组 */
+  .node.is-group { background: var(--color-background-tertiary); }
+  .node.is-group .node-name { font-weight: 500; color: var(--blue); }
+  .tag-main {
+    margin-left: 8px; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; background: #1a7f37; color: #fff;
+  }
+  .delay { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .delay.ok { color: var(--green); }
+  .delay.slow { color: #bf8700; }
+  .delay.bad { color: var(--red); }
+  .test-btn {
+    padding: 3px 9px; font-size: 12px; border-radius: 5px;
+    border: 1px solid var(--line); background: transparent;
+    color: var(--blue); cursor: pointer;
+  }
+  .test-btn:hover { background: var(--blue); color: #fff; border-color: var(--blue); }
+
+  /* ===== 设备面板 ===== */
+  .panel { margin-bottom: 26px; }
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px; flex-wrap: wrap; gap: 8px;
+  }
+  .panel-title { font-size: 15px; font-weight: 600; }
+  .cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+  .card {
+    padding: 12px 14px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 7px;
+  }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card-name { font-size: 14px; font-weight: 600; }
+  .metric { display: flex; align-items: baseline; gap: 4px; margin-top: 10px; }
+  .metric-val { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .metric-unit { font-size: 12px; color: var(--sub); }
+  .rows { margin-top: 8px; }
+  .row {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 12px; padding: 2px 0; color: var(--sub);
+  }
+  .row b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .sw {
+    position: relative; width: 42px; height: 24px; border-radius: 12px;
+    background: var(--line); border: none; cursor: pointer; flex: none;
+    transition: background .15s;
+  }
+  .sw::after {
+    content: ''; position: absolute; top: 3px; left: 3px;
+    width: 18px; height: 18px; border-radius: 50%; background: #fff;
+    transition: transform .15s; box-shadow: 0 1px 3px rgba(0,0,0,.3);
+  }
+  .sw.on { background: var(--green); }
+  .sw.on::after { transform: translateX(18px); }
+  .sw:disabled { opacity: .5; cursor: not-allowed; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--line); margin-right: 6px; }
+  .dot.on { background: var(--green); }
+  .dot.off { background: var(--sub); }
+  .msg { margin: 12px 0; padding: 9px 13px; border-radius: 6px; font-size: 13px; display: none; }
+  .msg.ok { display: block; background: #dafbe1; color: var(--green); }
+  .msg.err { display: block; background: #ffebe9; color: var(--red); }
+  .hint {
+    margin: 0 0 16px; padding: 10px 13px; font-size: 12px; line-height: 1.8;
+    background: var(--color-background-secondary);
+    border: 1px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg);
+    color: var(--color-text-secondary);
+  }
+  .hint strong { color: var(--text); }
+  footer { padding: 14px 20px; color: var(--sub); font-size: 12px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>代理组与节点 · 设备</h1>
+  <div class="sub" id="status">正在连接…</div>
+  <div class="toolbar">
+    <button class="primary" onclick="testAll()">测试全部</button>
+    <button onclick="location.reload()">刷新</button>
+  </div>
+</header>
+<main>
+  <div class="msg" id="msg"></div>
+  <div class="hint">
+    点击任意条目即可切换：<strong>带 ▸ 的是下级策略组</strong>，普通的是具体节点。
+    带<strong>「主策略组」</strong>标签的那个是当前所有代理流量实际经过的组 ——
+    改它才会改变全局出线路由。
+  </div>
+
+<section class="panel" id="devices">
+  <div class="panel-head">
+    <span class="panel-title">设备</span>
+    <button onclick="refreshDevices()">刷新</button>
+  </div>
+  <div class="cards" id="deviceCards">
+    <div class="card"><div class="sub">加载中…</div></div>
+  </div>
+</section>
+
+<div id="content"></div>
+</main>
+<footer>经由 mihomo REST API 控制 · 设备数据来自 Home Assistant · <span id="ver"></span></footer>
+
+<script>
+
+// 8090 = panel 反代（/mihomo 前缀，secret 由服务端注入）
+// 9090 = mihomo 自带 external-ui（同源直连，但 API 需要 secret）
+const PANEL_PORT = '8090';
+const API = location.port === PANEL_PORT
+  ? location.origin + '/mihomo'
+  : location.origin;
+const NEEDS_SECRET = location.port !== PANEL_PORT;
+let MIHOMO_SECRET = '';
+
+function applySecret() {
+  if (!NEEDS_SECRET) return;
+  if (!MIHOMO_SECRET) {
+    MIHOMO_SECRET = localStorage.getItem('mihomo_secret') || '';
+    if (!MIHOMO_SECRET) {
+      const v = prompt('请输入 mihomo secret（用于访问管理接口）');
+      if (v) { MIHOMO_SECRET = v.trim(); localStorage.setItem('mihomo_secret', MIHOMO_SECRET); }
+    }
+  }
+}
+let DATA = {};
+
+// ===== 设备面板（经反代访问 HA，令牌不落前端）=====
+const HA = '/ha';
+const DEVICES = {
+  ceiling: {
+    name: '卧室吸顶灯',
+    entity: 'switch.living_room_ceiling',
+    kind: 'switch',
+  },
+  ac: {
+    name: '空调',
+    kind: 'energy',
+    sensors: [
+      { entity: 'sensor.lumi_mcn02_c14b_electric_power', label: '实时功率', unit: 'W' },
+      { entity: 'sensor.lumi_mcn02_c14b_power_cost_today', label: '今日', unit: 'kWh' },
+      { entity: 'sensor.ac_energy_week_kwh', label: '本周', unit: 'kWh' },
+      { entity: 'sensor.lumi_mcn02_c14b_power_cost_month', label: '本月', unit: 'kWh' },
+      { entity: 'sensor.ac_energy_year_kwh', label: '本年', unit: 'kWh' },
+    ],
+  },
+};
+
+let HA_STATES = {};
+
+async function haGet(path) {
+  const r = await fetch(HA + path);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+async function haCall(domain, service, data) {
+  const r = await fetch(HA + '/services/' + domain + '/' + service, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data || {}),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 120));
+  return r.json();
+}
+
+function fmt(v, digits) {
+  const n = parseFloat(v);
+  if (isNaN(n)) return '--';
+  return digits === undefined ? n : n.toFixed(digits);
+}
+
+function renderDevices() {
+  const box = document.getElementById('deviceCards');
+  if (!box) return;
+  const cards = [];
+
+  // --- 吸顶灯开关 ---
+  const c = DEVICES.ceiling;
+  const st = HA_STATES[c.entity];
+  const on = st && st.state === 'on';
+  cards.push(
+    '<div class="card">' +
+      '<div class="switch-row">' +
+        '<span class="card-name"><span class="dot ' + (on ? 'on' : 'off') + '"></span>' + esc(c.name) + '</span>' +
+        '<button class="sw ' + (on ? 'on' : '') + '" id="swCeiling"' +
+          (st ? '' : ' disabled') + ' onclick="toggleCeiling()"></button>' +
+      '</div>' +
+      '<div class="rows">' +
+        '<div class="row"><span>状态</span><b>' + (st ? esc(st.state) : '--') + '</b></div>' +
+        (st && st.attributes && st.attributes.friendly_name
+          ? '<div class="row"><span>实体</span><b>' + esc(c.entity) + '</b></div>' : '') +
+      '</div>' +
+    '</div>'
+  );
+
+  // --- 空调用电 ---
+  const a = DEVICES.ac;
+  const main = HA_STATES[a.sensors[0].entity];
+  const mainVal = main ? fmt(main.state, 2) : '--';
+  const rows = a.sensors.map(s => {
+    const x = HA_STATES[s.entity];
+    const digits = s.unit === 'W' ? 2 : 3;
+    return '<div class="row"><span>' + esc(s.label) + '</span><b>' +
+      (x ? fmt(x.state, digits) : '--') + ' ' + esc(s.unit) + '</b></div>';
+  }).join('');
+  cards.push(
+    '<div class="card">' +
+      '<div class="card-head"><span class="card-name">' + esc(a.name) + '</span></div>' +
+      '<div class="metric"><span class="metric-val">' + mainVal + '</span>' +
+        '<span class="metric-unit">W</span></div>' +
+      '<div class="rows">' + rows + '</div>' +
+    '</div>'
+  );
+
+  box.innerHTML = cards.join('');
+}
+
+async function refreshDevices() {
+  try {
+    const states = await haGet('/states');
+    HA_STATES = {};
+    for (const s of states) HA_STATES[s.entity_id] = s;
+    renderDevices();
+  } catch (e) {
+    const box = document.getElementById('deviceCards');
+    if (box) box.innerHTML = '<div class="card"><div class="sub">设备数据加载失败：' +
+      esc(e.message) + '</div></div>';
+  }
+}
+
+async function toggleCeiling() {
+  const btn = document.getElementById('swCeiling');
+  if (btn) btn.disabled = true;
+  try {
+    const st = HA_STATES[DEVICES.ceiling.entity];
+    const svc = st && st.state === 'on' ? 'turn_off' : 'turn_on';
+    await haCall('switch', svc, { entity_id: DEVICES.ceiling.entity });
+    show(svc === 'turn_on' ? '卧室吸顶灯：已开' : '卧室吸顶灯：已关', true);
+    await refreshDevices();
+  } catch (e) {
+    show('控制失败：' + e.message, false);
+    if (btn) btn.disabled = false;
+  }
+}
+
+
+
+function show(text, ok) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.className = 'msg', 4000);
+}
+
+function delayClass(d) {
+  if (!d || d <= 0) return 'bad';
+  if (d >= 500) return 'bad';
+  if (d >= 200) return 'slow';
+  return 'ok';
+}
+
+async function api(path, opts) {
+  applySecret();
+  opts = opts || {};
+  if (MIHOMO_SECRET) {
+    opts.headers = Object.assign({}, opts.headers, {
+      'Authorization': 'Bearer ' + MIHOMO_SECRET,
+    });
+  }
+  const r = await fetch(API + path, opts);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+// 读取所有代理组
+async function load() {
+  // 注意：/proxies 返回 { proxies: {...}, dns:..., rules:... }
+  // 真正的节点字典在 .proxies 里，必须先取出来
+  const data = await api('/proxies');
+  const dict = data.proxies || data;
+  const groups = [];
+  for (const [name, p] of Object.entries(dict)) {
+    if (p && p.type && ['Selector', 'URLTest', 'Fallback', 'LoadBalance'].includes(p.type)) {
+      groups.push({ name, type: p.type, now: p.now, all: p.all || [], main: false });
+    }
+  }
+
+  // 找出「主策略组」= 被最多规则引用的那个 Selector 组
+  // GLOBAL 是 mihomo 全局模式的特殊组，rule 模式下不参与，先排除
+  const refs = {};
+  for (const g of groups) {
+    if (g.name === 'GLOBAL') continue;
+    g.all.forEach(n => { refs[n] = (refs[n] || 0) + 1; });
+  }
+  const mainName = groups
+    .filter(g => g.name !== 'GLOBAL' && g.type === 'Selector')
+    .sort((a, b) => (refs[b.name] || 0) - (refs[a.name] || 0))[0];
+  if (mainName) mainName.main = true;
+
+  return { proxies: dict, groups };
+}
+
+function render() {
+  const box = document.getElementById('content');
+  box.innerHTML = DATA.groups.map(g => `
+    <section class="group">
+      <div class="group-head">
+        <div>
+          <span class="group-name">${esc(g.name)}</span>
+          <span class="sub"> · ${typeName(g.type)}</span>
+          ${g.main ? '<span class="tag-main">主策略组</span>' : ''}
+        </div>
+        <div>
+          <span class="badge">当前：${esc(g.now || '-')}</span>
+          <button class="test-btn" data-test="${esc(g.name)}">测试</button>
+        </div>
+      </div>
+      <div class="grid">
+        ${g.all.map(n => {
+          const sub = DATA.groups.find(x => x.name === n);
+          const isGrp = !!sub;
+          return `
+          <div class="node ${n === g.now ? 'active' : ''} ${isGrp ? 'is-group' : ''}"
+               data-g="${esc(g.name)}" data-n="${esc(n)}">
+            <span class="node-name" title="${esc(n)}">${isGrp ? '▸ ' : ''}${esc(n)}</span>
+            <span class="delay" data-d="${esc(g.name)}||${esc(n)}">未测</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </section>
+  `).join('');
+  document.getElementById('status').textContent =
+    `${DATA.groups.length} 个策略组 · 已连接`;
+}
+
+// 事件委托：避免在 HTML 属性里拼 JS 字符串（节点名含中文/百分号会破坏属性解析）
+document.getElementById('content').addEventListener('click', e => {
+  const btn = e.target.closest('[data-test]');
+  if (btn) { testGroup(btn.dataset.test, btn); return; }
+  const node = e.target.closest('[data-g]');
+  if (node) select(node.dataset.g, node.dataset.n);
+});
+
+function setDelayEl(group, node, d) {
+  const el = document.querySelector(`[data-d="${CSS.escape(group + '||' + node)}"]`);
+  if (!el) return;
+  el.textContent = d > 0 ? d + ' ms' : '超时';
+  el.className = 'delay ' + delayClass(d);
+}
+
+function typeName(t) {
+  return { Selector: '手动选择', URLTest: '自动测速', Fallback: '故障转移', LoadBalance: '负载均衡' }[t] || t;
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function md5ish(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+async function select(group, node) {
+  try {
+    await api('/proxies/' + encodeURIComponent(group), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: node })
+    });
+    show(`已切换：${group} → ${node}`, true);
+    DATA = await load();
+    render();
+  } catch (e) {
+    show('切换失败：' + e.message, false);
+  }
+}
+
+async function testOne(node) {
+  try {
+    const r = await api('/proxies/' + encodeURIComponent(node) +
+      '/delay?timeout=5000&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204');
+    return r.delay;
+  } catch { return -1; }
+}
+
+async function runQueue(items, group, onDone) {
+  const queue = [...items];
+  const worker = async () => {
+    while (queue.length) {
+      const n = queue.shift();
+      const d = await testOne(n);
+      onDone(n, d);
+    }
+  };
+  await Promise.all(Array.from({ length: 8 }, worker));
+}
+
+async function testGroup(group, btn) {
+  const g = DATA.groups.find(x => x.name === group);
+  if (!g) return;
+  btn.textContent = '测试中…';
+  await runQueue(g.all, group, (n, d) => setDelayEl(group, n, d));
+  btn.textContent = '测试';
+  show(`${group} 测试完成`, true);
+}
+
+async function testAll() {
+  show('正在测试所有节点…', true);
+  for (const g of DATA.groups) {
+    await runQueue(g.all, g.name, (n, d) => setDelayEl(g.name, n, d));
+  }
+  show('全部测试完成', true);
+}
+
+(async () => {
+  refreshDevices();
+  setInterval(refreshDevices, 15000);
+  try {
+    DATA = await load();
+    render();
+  } catch (e) {
+    document.getElementById('status').textContent = '连接失败：' + e.message;
+    show('无法连接 mihomo 管理接口：' + e.message, false);
+  }
+})();
+
+// 兜底：任何未捕获错误都显示出来，不要白屏
+window.addEventListener('error', e => {
+  show('页面错误：' + (e.message || e), false);
+});
+</script>
+</body>
+</html>

@@ -1,14 +1,15 @@
 ﻿#include <Arduino.h>
 #include <EEPROM.h>
 #include <ESP8266HTTPClient.h>
-#include <ESP8266HTTPUpdateServer.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <IRrecv.h>
 #include <IRsend.h>
 #include <IRutils.h>
 #include <LittleFS.h>
+#include <ESP8266mDNS.h>
 #include <new>
+#include <stdarg.h>
 #include <time.h>
 #define BLINKER_PRINT Serial
 #define BLINKER_WIFI
@@ -16,11 +17,37 @@
 #define BLINKER_DUEROS_MULTI_OUTLET
 void blinkerInboundAliGenie(const char* data);
 void blinkerInboundAliGenieParsed();
+void blinkerInboundAny(const char* data);
 #include <Blinker.h>
 #include <RCSwitch.h>
 
 #ifndef ENABLE_IR_AC_PRESETS
 #define ENABLE_IR_AC_PRESETS 0
+#endif
+
+// OTA 网页升级开关。关闭可省下 ESP8266httpUpdate + MD5/SHA 校验的 Flash 与 RAM。
+#ifndef ENABLE_OTA_UPDATE
+#define ENABLE_OTA_UPDATE 1
+#endif
+
+#if ENABLE_OTA_UPDATE
+#include <ESP8266HTTPUpdateServer.h>
+#endif
+
+// worldtimeapi 网络授时开关。关闭后仅保留 NTP 本地授时（configTime，不需 HTTP 客户端）。
+#ifndef ENABLE_WEB_TIME_SYNC
+#define ENABLE_WEB_TIME_SYNC 1
+#endif
+
+// 运行日志持久化到 LittleFS 的开关。开启后重启/崩溃仍可回查掉电前的日志。
+// 采用「RAM 攒批 + 定时追加」策略，不逐条落盘，避免磨损 flash 与阻塞 loop。
+#ifndef ENABLE_LOG_PERSIST
+#define ENABLE_LOG_PERSIST 1
+#endif
+
+// 日志落盘间隔（毫秒）。调小=崩溃前丢的日志更少，但 flash 写入更频繁。
+#ifndef LOG_FLUSH_INTERVAL_MS
+#define LOG_FLUSH_INTERVAL_MS 30000UL
 #endif
 
 #if ENABLE_IR_AC_PRESETS
@@ -47,15 +74,28 @@ constexpr uint8_t MAX_VOICE_RF_REPEAT_TRANSMIT = 40;
 constexpr uint16_t SCREEN_WIDTH = 128;
 constexpr uint16_t SCREEN_HEIGHT = 64;
 constexpr unsigned long WIFI_JOIN_TIMEOUT_MS = 15000UL;
+// mDNS 主机名，外部集成（Home Assistant 等）可用 esp8266-433.local 代替 IP 访问，
+// 这样路由器重新分配 IP 时不用改配置。
+constexpr const char* MDNS_HOSTNAME = "esp8266-433";
+// mDNS 注册失败时的重试间隔
+constexpr unsigned long MDNS_RETRY_MS = 5000UL;
+constexpr unsigned long BLINKER_LINK_REPORT_MS = 10000UL;
 constexpr unsigned long OLED_STATUS_REFRESH_MS = 15000UL;
 constexpr unsigned long OLED_TITLE_REFRESH_MS = 60000UL;
 constexpr unsigned long TIME_SYNC_INTERVAL_MS = 3600000UL;
 constexpr unsigned long TIME_SYNC_RETRY_MS = 60000UL;
 constexpr uint8_t VOICE_OUTLET_COUNT = 6;
+// 日志环形缓冲：常驻 RAM，LOG_LINE_COUNT*LOG_LINE_MAX 字节。
+// 可用 -DLOG_LINE_COUNT / -DLOG_LINE_MAX 覆盖以压缩内存（见 platformio.ini 说明）。
+#ifndef LOG_LINE_COUNT
+#define LOG_LINE_COUNT 40
+#endif
+#ifndef LOG_LINE_MAX
+#define LOG_LINE_MAX 120
+#endif
+
 constexpr uint8_t RF_SLOT_COUNT = 6;
 constexpr uint8_t IR_SLOT_COUNT = 6;
-constexpr uint8_t LOG_LINE_COUNT = 40;
-constexpr uint16_t LOG_LINE_MAX = 120;
 constexpr uint16_t IR_RAW_MAX = 256;
 constexpr uint16_t IR_CAPTURE_BUFFER_SIZE = 512;
 constexpr uint8_t IR_TIMEOUT_MS = 50;
@@ -75,6 +115,13 @@ const char* NTP_SERVER_3 = "time.windows.com";
 const char* RF_CODES_PATH = "/rf_codes.txt";
 const char* IR_CODES_PATH = "/ir_codes.txt";
 const char* SETTINGS_BACKUP_PATH = "/settings.txt";
+
+// 运行日志持久化路径与容量。写满后 /log.txt 轮转为 /log.1.txt（只保留上一份），
+// 因此文件系统最多占用 2 * LOG_FILE_MAX_BYTES。
+const char* LOG_FILE_PATH = "/log.txt";
+const char* LOG_FILE_PREV_PATH = "/log.1.txt";
+constexpr size_t LOG_FILE_MAX_BYTES = 32UL * 1024UL;
+constexpr size_t LOG_PENDING_MAX = 400;
 
 struct RfCode {
   uint32_t value;
@@ -137,9 +184,25 @@ IRac irac(IR_TX_PIN);
 IRrecv irrecv(IR_RX_PIN, IR_CAPTURE_BUFFER_SIZE, IR_TIMEOUT_MS, true);
 decode_results irResults;
 ESP8266WebServer server(80);
+#if ENABLE_OTA_UPDATE
 ESP8266HTTPUpdateServer httpUpdater;
+#endif
 
-String lastMessage = "Booting";
+// 最近一条状态消息。用固定缓冲而非 String：
+// 该变量在 loop() 里随射频/红外事件频繁重写，String 会不断申请/释放堆内存，
+// 长期运行会加剧堆碎片。改用 snprintf 写入静态缓冲，堆分配为零。
+constexpr size_t LAST_MESSAGE_MAX = 48;
+char lastMessage[LAST_MESSAGE_MAX] = "Booting";
+
+void setLastMessage(const char* format, ...);
+
+void setLastMessage(const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  vsnprintf(lastMessage, sizeof(lastMessage), format, args);
+  va_end(args);
+}
+
 RfCode lastReceived = {0, 0, 0, 0};
 unsigned long lastReceivedAt = 0;
 uint8_t learnSlot = 0;
@@ -161,6 +224,8 @@ IPAddress lastOledIp;
 uint32_t syncedLocalEpoch = 0;
 bool voiceStarted = false;
 bool voiceOutletState[VOICE_OUTLET_COUNT + 1] = {false};
+// 433 码位的"请求状态"，供 HTTP 状态接口回读（真实灯况无法回读，见 handleSendV2 注释）
+bool rfSlotState[RF_SLOT_COUNT + 1] = {false};
 uint32_t aliGenieCommandCount = 0;
 uint32_t lastAliGenieCommandAt = 0;
 uint32_t aliGenieRawCount = 0;
@@ -204,6 +269,51 @@ bool wifiConnected() {
   return WiFi.status() == WL_CONNECTED;
 }
 
+#if ENABLE_LOG_PERSIST
+// 待落盘缓冲。日志先攒在这里，由 loop() 定时或在写满时一次性追加到文件。
+char logPending[LOG_PENDING_MAX];
+size_t logPendingLen = 0;
+unsigned long lastLogFlushAt = 0;
+
+// 把待写缓冲追加到日志文件。返回 true 表示缓冲已全部写出。
+// 注意：文件系统未就绪时直接返回，缓冲保留，等挂载成功后再写，
+// 因此启动早期的日志不会丢。
+bool flushLogToFile() {
+  if (logPendingLen == 0) return true;
+  if (!fsReady) return false;
+
+  // 写满则轮转：删除更早的一份，把当前文件改名保留，再新建
+  if (LittleFS.exists(LOG_FILE_PATH)) {
+    File probe = LittleFS.open(LOG_FILE_PATH, "r");
+    size_t size = probe ? probe.size() : 0;
+    if (probe) probe.close();
+    if (size >= LOG_FILE_MAX_BYTES) {
+      LittleFS.remove(LOG_FILE_PREV_PATH);
+      if (LittleFS.rename(LOG_FILE_PATH, LOG_FILE_PREV_PATH)) {
+        Serial.println("Log file rotated");
+      }
+    }
+  }
+
+  File file = LittleFS.open(LOG_FILE_PATH, "a");
+  if (!file) {
+    Serial.println("Log file open failed, buffer kept");
+    return false;
+  }
+  size_t written = file.write(reinterpret_cast<const uint8_t*>(logPending), logPendingLen);
+  file.close();
+
+  if (written >= logPendingLen) {
+    logPendingLen = 0;
+    return true;
+  }
+  // 部分写入：保留未写出的部分，下次重试
+  memmove(logPending, logPending + written, logPendingLen - written);
+  logPendingLen -= written;
+  return false;
+}
+#endif
+
 void addLog(const char* format, ...) {
   char message[LOG_LINE_MAX - 16];
   va_list args;
@@ -217,16 +327,31 @@ void addLog(const char* format, ...) {
   uint8_t hours = timeSynced
       ? (totalSeconds % 86400UL) / 3600UL
       : (totalSeconds / 3600UL) % 100UL;
-  snprintf(logLines[logLineNext],
+  uint8_t slot = logLineNext;
+  snprintf(logLines[slot],
            LOG_LINE_MAX,
            "%02u:%02u:%02u %s",
            hours,
            static_cast<uint8_t>((totalSeconds / 60UL) % 60UL),
            static_cast<uint8_t>(totalSeconds % 60UL),
            message);
-  Serial.println(logLines[logLineNext]);
+  Serial.println(logLines[slot]);
   logLineNext = (logLineNext + 1) % LOG_LINE_COUNT;
   if (logLineUsed < LOG_LINE_COUNT) logLineUsed++;
+
+#if ENABLE_LOG_PERSIST
+  size_t lineLength = strlen(logLines[slot]);
+  if (lineLength > sizeof(logPending) - 1) lineLength = sizeof(logPending) - 1;
+  // 装不下就先把已有的写出去，尽量不丢日志
+  if (logPendingLen + lineLength + 1 > sizeof(logPending)) {
+    flushLogToFile();
+  }
+  if (logPendingLen + lineLength + 1 <= sizeof(logPending)) {
+    memcpy(logPending + logPendingLen, logLines[slot], lineLength);
+    logPendingLen += lineLength;
+    logPending[logPendingLen++] = '\n';
+  }
+#endif
 }
 
 void blinkerInboundAliGenie(const char* data) {
@@ -235,6 +360,37 @@ void blinkerInboundAliGenie(const char* data) {
   addLog("AliGenie RAW #%lu %s",
          static_cast<unsigned long>(rawNumber),
          data != nullptr && data[0] != '\0' ? data : "<empty>");
+}
+
+// 全量下行报文捕获：在库内 parseData() 入口无条件调用，不受 checkAliAvail() 限制。
+// 用途是区分「云端根本没发」和「发了但协议/来源不匹配」——
+// fromDevice 字段标明这条指令到底是谁下发的（AliGenie / DuerOS / App 自身）。
+void blinkerInboundAny(const char* data) {
+  if (data == nullptr || data[0] == '\0') {
+    addLog("RX any <empty>");
+    return;
+  }
+
+  const char* from = strstr(data, "\"fromDevice\"");
+  if (from == nullptr) from = strstr(data, "\"from\"");
+
+  char fromBuf[40] = {0};
+  if (from != nullptr) {
+    const char* colon = strchr(from, ':');
+    if (colon != nullptr) {
+      const char* q1 = strchr(colon, '"');
+      if (q1 != nullptr) {
+        const char* q2 = strchr(q1 + 1, '"');
+        if (q2 != nullptr && static_cast<size_t>(q2 - q1 - 1) < sizeof(fromBuf)) {
+          memcpy(fromBuf, q1 + 1, static_cast<size_t>(q2 - q1 - 1));
+        }
+      }
+    }
+  }
+
+  addLog("RX any from=%s data=%s",
+         fromBuf[0] != '\0' ? fromBuf : "?",
+         data);
 }
 
 void blinkerInboundAliGenieParsed() {
@@ -516,6 +672,7 @@ bool syncNtpTime() {
   return false;
 }
 
+#if ENABLE_WEB_TIME_SYNC
 bool syncWorldTimeApi() {
   if (!wifiConnected()) {
     Serial.println("Time sync skipped: WiFi not connected");
@@ -560,13 +717,16 @@ bool syncWorldTimeApi() {
   Serial.printf("Time synced by worldtimeapi: %s\n", localTimeTitle().c_str());
   return true;
 }
+#endif
 
 bool syncTime() {
+#if ENABLE_WEB_TIME_SYNC
   if (syncWorldTimeApi()) {
     return true;
   }
 
   Serial.println("Worldtimeapi failed, trying NTP fallback");
+#endif
   return syncNtpTime();
 }
 
@@ -756,6 +916,11 @@ String htmlEscape(const String& text) {
   return escaped;
 }
 
+// 固定缓冲版本，避免为 lastMessage 之类的 char 缓冲构造临时 String。
+String htmlEscape(const char* text) {
+  return htmlEscape(String(text));
+}
+
 void drawStatus() {
   if (!oledReady) return;
 
@@ -785,7 +950,7 @@ void drawStatus() {
     oledDrawText(page++, 0, ipLine);
   }
 
-  String lastLine = "Last: " + lastMessage;
+  String lastLine = String(F("Last: ")) + lastMessage;
   oledDrawText(page++, 0, lastLine);
   if (lastReceived.value != 0) {
     String rxLine = "RX: " + String(lastReceived.value);
@@ -803,9 +968,27 @@ void drawStatus() {
 }
 
 void showOledEventLine(uint8_t page, const String& message) {
-  lastMessage = message;
+  // 事件行加 HH:MM 本地时间前缀（与 addLog 用同一时间源，保证两者一致）。
+  // 屏宽 128px / 每字符 6px = 21 字符，"HH:MM " 占 6 格，消息留 15 格。
+  // 未同步时间时退化为运行时长（小时:分钟），与 addLog 的降级行为一致。
+  uint32_t totalSeconds = timeSynced
+      ? syncedLocalEpoch + (millis() - lastTimeSyncAt) / 1000UL
+      : millis() / 1000UL;
+  char stamp[8];
+  if (timeSynced) {
+    snprintf(stamp, sizeof(stamp), "%02u:%02u ",
+             static_cast<unsigned>((totalSeconds % 86400UL) / 3600UL),
+             static_cast<unsigned>((totalSeconds / 60UL) % 60UL));
+  } else {
+    snprintf(stamp, sizeof(stamp), "%02u:%02u ",
+             static_cast<unsigned>((totalSeconds / 3600UL) % 100UL),
+             static_cast<unsigned>((totalSeconds / 60UL) % 60UL));
+  }
+
+  setLastMessage("%s%s", stamp, message.c_str());
+
   if (!oledReady) return;
-  oledDrawTextLine(page, message);
+  oledDrawTextLine(page, String(stamp) + message);
 }
 
 void setupOled() {
@@ -872,7 +1055,7 @@ bool setIrSlotRaw(IrSlot& irSlot, const uint16_t* raw, uint16_t length) {
 
   irSlot.raw = new (std::nothrow) uint16_t[length];
   if (irSlot.raw == nullptr) {
-    lastMessage = "IR save no memory";
+    setLastMessage("IR save no memory");
     drawStatus();
     return false;
   }
@@ -1087,7 +1270,7 @@ String acFanName(uint8_t value) {
 bool sendAcPreset(decode_type_t protocol, int16_t model, bool power, uint8_t mode,
                   uint8_t temp, uint8_t fan, const String& source) {
   if (!IRac::isProtocolSupported(protocol)) {
-    lastMessage = source + " AC unsupported";
+    setLastMessage("%s AC unsupported", source.c_str());
     Serial.printf("AC preset unsupported: protocol=%d\n", static_cast<int>(protocol));
     drawStatus();
     return false;
@@ -1109,7 +1292,8 @@ bool sendAcPreset(decode_type_t protocol, int16_t model, bool power, uint8_t mod
                         false,
                         false,
                         true);
-  lastMessage = ok ? (source + " AC " + brandForAcProtocol(protocol)) : (source + " AC failed");
+  setLastMessage("%s AC %s", source.c_str(),
+                 ok ? brandForAcProtocol(protocol).c_str() : "failed");
   Serial.printf("AC preset TX: protocol=%d brand=%s model=%d power=%u mode=%u temp=%u fan=%u ok=%u\n",
                 static_cast<int>(protocol),
                 brandForAcProtocol(protocol).c_str(),
@@ -1402,7 +1586,7 @@ bool transmitSavedSlot(uint8_t slot, const String& source) {
 
 bool transmitSavedIrSlot(uint8_t slot, const String& source) {
   if (slot < 1 || slot > IR_SLOT_COUNT || !hasIrCode(slot - 1)) {
-    lastMessage = source + " IR " + String(slot) + " empty";
+    setLastMessage("%s IR %u empty", source.c_str(), slot);
     drawStatus();
     return false;
   }
@@ -1421,13 +1605,13 @@ bool transmitSavedIrSlot(uint8_t slot, const String& source) {
   }
 
   if (code.raw == nullptr || code.length == 0) {
-    lastMessage = source + " IR " + String(slot) + " empty";
+    setLastMessage("%s IR %u empty", source.c_str(), slot);
     drawStatus();
     return false;
   }
 
   irsend.sendRaw(code.raw, code.length, code.frequency);
-  lastMessage = source + " IR " + String(slot);
+  setLastMessage("%s IR %u", source.c_str(), slot);
   Serial.printf("IR TX slot=%u name=%s len=%u freq=%u GPIO%u\n",
                 slot,
                 code.name,
@@ -1447,250 +1631,91 @@ void sendCode(uint8_t index) {
   server.send(302, "text/plain", "");
 }
 
-static const char APP_CSS[] PROGMEM = R"rawliteral(
-:root{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light;--bg:#f4f6fa;--panel:#fff;--panel2:#f8fafc;--text:#172033;--muted:#667085;--line:#e5e7ef;--primary:#2563eb;--primaryText:#fff;--soft:#eef2ff;--softText:#273a8a;--warn:#fff7ed;--warnText:#9a3412;--shadow:0 1px 2px rgba(16,24,40,.05)}
-:root[data-scheme=dark]{color-scheme:dark;--bg:#12151b;--panel:#1b2029;--panel2:#242b36;--text:#edf1f7;--muted:#aab4c2;--line:#303846;--primary:#4f8cff;--primaryText:#fff;--soft:#253553;--softText:#cfe0ff;--warn:#3a291b;--warnText:#ffc08a;--shadow:none}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text)}a{color:inherit}.wrap{max-width:1120px;margin:0 auto;padding:20px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:16px}.title h1{font-size:24px;line-height:1.2;margin:0 0 6px}.muted{color:var(--muted);font-size:14px;line-height:1.5}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}.tabs{display:flex;gap:6px;margin:0 0 14px;border-bottom:1px solid var(--line);overflow:auto}.tab{appearance:none;border:0;background:transparent;color:var(--muted);font-weight:700;padding:12px 14px;border-bottom:2px solid transparent;white-space:nowrap;cursor:pointer}.tab.active{color:var(--primary);border-color:var(--primary)}.panel{display:none}.panel.active{display:block}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:var(--shadow);margin-bottom:14px}.card h2{font-size:18px;margin:0 0 12px}.card h3{font-size:15px;margin:0 0 10px}.status{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.kv{background:var(--panel2);border-radius:6px;padding:10px;min-height:58px}.kv b{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}.meta{font-size:13px;color:var(--muted);margin-top:10px;word-break:break-all;line-height:1.5}.actions,.inline-actions{display:flex;gap:8px;flex-wrap:wrap}.btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;border:0;border-radius:8px;background:var(--primary);color:var(--primaryText);font-weight:700;font-size:14px;text-decoration:none;padding:0 13px;cursor:pointer}.btn.secondary{background:var(--soft);color:var(--softText)}.btn.warn{background:var(--warn);color:var(--warnText);border:1px solid color-mix(in srgb,var(--warnText) 28%,transparent)}form{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;align-items:end}.field{min-width:0}.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}input,select{width:100%;height:38px;border:1px solid var(--line);border-radius:6px;padding:0 9px;font-size:14px;background:var(--panel);color:var(--text)}input[type=file]{padding:7px;height:auto}.span2{grid-column:span 2}.span3{grid-column:span 3}.span6{grid-column:1/-1}.slot-grid{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.slot-card{display:flex;flex-direction:column;gap:5px;padding:10px;margin-bottom:8px}.slot-card h3{font-size:14px;margin:0}.slot-card .meta{font-size:12px;line-height:1.35;margin-top:2px}.slot-card .actions{gap:6px}.slot-card .actions .btn{flex:1;min-width:64px;min-height:32px;font-size:13px;padding:0 9px}.section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:10px}@media(max-width:720px){.wrap{padding:14px}.top{display:block}.toolbar{justify-content:flex-start;margin-top:10px}form{grid-template-columns:1fr 1fr}.span2,.span3,.span6{grid-column:1/-1}.tabs{position:sticky;top:0;background:var(--bg);z-index:2}.btn{width:100%}.actions .btn,.inline-actions .btn{width:auto}.slot-grid{grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px}}
-.voice-flow{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;align-items:stretch}.voice-step{position:relative;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px;min-height:116px}.voice-step b{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:var(--primary);color:var(--primaryText);font-size:13px;margin-bottom:8px}.voice-step strong{display:block;font-size:14px;margin-bottom:5px}.voice-step small{display:block;color:var(--muted);font-size:12px;line-height:1.45}.voice-step:not(:last-child)::after{content:"";position:absolute;right:-8px;top:50%;width:8px;height:2px;background:var(--line)}.voice-map{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px}@media(max-width:840px){.voice-flow{grid-template-columns:1fr}.voice-step{min-height:auto}.voice-step:not(:last-child)::after{display:none}}
-.toast{position:fixed;left:50%;bottom:18px;z-index:20;max-width:min(92vw,420px);transform:translateX(-50%) translateY(18px);opacity:0;background:var(--text);color:var(--panel);border-radius:8px;padding:10px 14px;font-size:14px;font-weight:700;box-shadow:0 10px 28px rgba(16,24,40,.22);pointer-events:none;transition:opacity .16s ease,transform .16s ease}.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}.btn.busy{opacity:.72;pointer-events:none;position:relative}.btn.busy::after{content:"";width:14px;height:14px;margin-left:8px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .75s linear infinite}form.is-submitting{opacity:.88}@keyframes spin{to{transform:rotate(360deg)}}
-.log-view{margin:0;max-height:520px;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:12px;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;white-space:pre-wrap;word-break:break-word}
+// ============================================================
+// 前端静态资源 app.css / app.js
+//
+// 完整版存放在工程 data/ 目录，通过 `pio run -t uploadfs` 写入 LittleFS，
+// 运行时由 /app.css、/app.js 路由从文件系统流式读出。
+// 好处：只改样式或脚本时不必重新编译烧录固件。
+//
+// 下面保留一份精简内置版作为兜底：文件系统为空时（例如刚 erase_flash()
+// 还没执行 uploadfs）自动启用，保证布局与导航仍可用，仅外观较简单。
+// 注：标签页与面板显示是服务端渲染的，不依赖 JS，因此兜底不影响导航。
+// ============================================================
+
+static const char FALLBACK_CSS[] PROGMEM = R"rawliteral(
+:root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;--bg:#f4f6fa;--panel:#fff;--panel2:#f8fafc;--text:#172033;--muted:#667085;--line:#e5e7ef;--primary:#2563eb;--primaryText:#fff;--soft:#eef2ff;--softText:#273a8a;--warn:#fff7ed;--warnText:#9a3412}
+:root[data-scheme=dark]{--bg:#12151b;--panel:#1b2029;--panel2:#242b36;--text:#edf1f7;--muted:#aab4c2;--line:#303846;--primary:#4f8cff;--soft:#253553;--softText:#cfe0ff;--warn:#3a291b;--warnText:#ffc08a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text)}a{color:inherit}
+.wrap{max-width:1120px;margin:0 auto;padding:20px}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:16px}
+.title h1{font-size:24px;margin:0 0 6px;line-height:1.2}
+.muted{color:var(--muted);font-size:14px;line-height:1.5}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.tabs{display:flex;gap:6px;margin:0 0 14px;border-bottom:1px solid var(--line);overflow:auto}
+.tab{appearance:none;border:0;background:transparent;color:var(--muted);font-weight:700;padding:12px 14px;border-bottom:2px solid transparent;white-space:nowrap;cursor:pointer;text-decoration:none}
+.tab.active{color:var(--primary);border-color:var(--primary)}
+.panel{display:none}.panel.active{display:block}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:14px}
+.card h2{font-size:18px;margin:0 0 12px}.card h3{font-size:15px;margin:0 0 10px}
+.status{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}
+.kv{background:var(--panel2);border-radius:6px;padding:10px;min-height:58px}
+.kv b{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+.meta{font-size:13px;color:var(--muted);margin-top:10px;word-break:break-all;line-height:1.5}
+.actions,.inline-actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;border:0;border-radius:8px;background:var(--primary);color:var(--primaryText);font-weight:700;font-size:14px;text-decoration:none;padding:0 13px;cursor:pointer}
+.btn.secondary{background:var(--soft);color:var(--softText)}
+.btn.warn{background:var(--warn);color:var(--warnText)}
+form{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;align-items:end}
+.field{min-width:0}.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+input,select{width:100%;height:38px;border:1px solid var(--line);border-radius:6px;padding:0 9px;font-size:14px;background:var(--panel);color:var(--text)}
+input[type=file]{padding:7px;height:auto}
+.span2{grid-column:span 2}.span3{grid-column:span 3}.span6{grid-column:1/-1}
+.section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:10px}
+.slot-grid{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.slot-card{display:flex;flex-direction:column;gap:5px;padding:10px;margin-bottom:8px}
+.slot-card h3{font-size:14px;margin:0}
+.log-view{margin:0;max-height:520px;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:12px;font:12px/1.55 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+.toast{position:fixed;left:50%;bottom:18px;max-width:min(92vw,420px);transform:translateX(-50%);background:var(--text);color:var(--panel);border-radius:8px;padding:10px 14px;font-size:14px;font-weight:700}
+@media(max-width:720px){.wrap{padding:14px}.top{display:block}form{grid-template-columns:1fr 1fr}.span2,.span3,.span6{grid-column:1/-1}.btn{width:100%}}
 )rawliteral";
 
-static const char APP_JS[] PROGMEM = R"rawliteral(
+static const char FALLBACK_JS[] PROGMEM = R"rawliteral(
 (function () {
-  window.onerror = function (message, source, line) {
-    if (window.console && console.log) console.log("ESP UI error", message, source, line);
-  };
-  function log() {
-    if (window.console && console.log) console.log.apply(console, arguments);
+  var scheme = document.querySelector("[data-scheme]");
+  function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function apply(v) {
+    if (v && v !== "system") document.documentElement.setAttribute("data-scheme", v);
+    else document.documentElement.removeAttribute("data-scheme");
   }
-  function all(selector) {
-    return Array.prototype.slice.call(document.querySelectorAll(selector));
-  }
-  function hasClass(element, name) {
-    return element && (" " + element.className + " ").indexOf(" " + name + " ") >= 0;
-  }
-  function addClass(element, name) {
-    if (element && !hasClass(element, name)) element.className += (element.className ? " " : "") + name;
-  }
-  function removeClass(element, name) {
-    if (element) element.className = (" " + element.className + " ").replace(" " + name + " ", " ").replace(/^\s+|\s+$/g, "");
-  }
-  function toggleClass(element, name, on) {
-    if (on) addClass(element, name);
-    else removeClass(element, name);
-  }
-  function closest(element, selector) {
-    while (element && element !== document) {
-      var matcher = element.matches || element.msMatchesSelector || element.webkitMatchesSelector;
-      if (matcher && matcher.call(element, selector)) return element;
-      element = element.parentNode;
-    }
-    return null;
-  }
-  function readStorage(name, fallback) {
-    try {
-      return localStorage.getItem(name) || fallback;
-    } catch (error) {
-      return fallback;
-    }
-  }
-  function writeStorage(name, value) {
-    try {
-      localStorage.setItem(name, value);
-    } catch (error) {
-    }
-  }
-
-  var root = document.documentElement;
-  var media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
-  var scheme = readStorage("scheme", "system");
-  function applyScheme(value) {
-    var dark = value === "dark" || (value === "system" && media && media.matches);
-    root.setAttribute("data-scheme", dark ? "dark" : "light");
-  }
-  var schemeSelect = document.querySelector("[data-scheme]");
-  if (schemeSelect) {
-    schemeSelect.value = scheme;
-    schemeSelect.onchange = function () {
-      writeStorage("scheme", schemeSelect.value);
-      applyScheme(schemeSelect.value);
-    };
-  }
-  applyScheme(scheme);
-  if (media) {
-    var onSchemeChange = function () {
-      applyScheme(readStorage("scheme", "system"));
-    };
-    if (media.addEventListener) media.addEventListener("change", onSchemeChange);
-    else if (media.addListener) media.addListener(onSchemeChange);
-  }
-
-  var tabs = all("[data-tab]");
-  var panels = all("[data-panel]");
-  log("ESP UI boot", "tabs", tabs.length, "panels", panels.length, "hash", location.hash);
-  function hasPanel(name) {
-    for (var i = 0; i < panels.length; i++) {
-      if (panels[i].getAttribute("data-panel") === name) return true;
-    }
-    return false;
-  }
-  function activate(name) {
-    if (!name || !hasPanel(name)) name = "system";
-    log("tab activate", name);
-    for (var i = 0; i < tabs.length; i++) {
-      toggleClass(tabs[i], "active", tabs[i].getAttribute("data-tab") === name);
-    }
-    for (var j = 0; j < panels.length; j++) {
-      toggleClass(panels[j], "active", panels[j].getAttribute("data-panel") === name);
-    }
-    if (location.hash.slice(1) !== name && history.replaceState) history.replaceState(null, "", "#" + name);
-  }
-  for (var t = 0; t < tabs.length; t++) {
-    tabs[t].onclick = function () {
-      activate(this.getAttribute("data-tab"));
-    };
-  }
-  activate(location.hash.slice(1) || "system");
-  window.onhashchange = function () {
-    activate(location.hash.slice(1) || "system");
-  };
-
-  var toggles = all("[data-toggle-password]");
-  for (var p = 0; p < toggles.length; p++) {
-    toggles[p].onchange = function () {
-      var form = closest(this, "form") || document;
-      var input = form.querySelector("input[data-password]");
-      if (input) input.type = this.checked ? "text" : "password";
-    };
-  }
-
-  var logView = document.querySelector("[data-log-view]");
-  var logStatus = document.querySelector("[data-log-status]");
-  var logButton = document.querySelector("[data-refresh-logs]");
-  var clearLogButton = document.querySelector("[data-clear-logs]");
-  function refreshLogs() {
-    if (!logView || !window.fetch) {
-      if (location.hash.slice(1) === "logs") location.href = "/logs";
-      return;
-    }
-    if (logStatus) logStatus.textContent = "\u6b63\u5728\u5237\u65b0...";
-    fetch("/logs?ts=" + Date.now(), { cache: "no-store" })
-      .then(function (response) { return response.text(); })
-      .then(function (text) {
-        logView.textContent = text || "\u6682\u65e0\u65e5\u5fd7";
-        logView.scrollTop = logView.scrollHeight;
-        if (logStatus) {
-          var lines = text ? text.replace(/\s+$/g, "").split("\n").filter(function (line) { return line.length > 0; }).length : 0;
-          logStatus.textContent = "\u5df2\u5237\u65b0\uff0c\u5171 " + lines + " \u6761";
-        }
-      })
-      .catch(function () {
-        if (logStatus) logStatus.textContent = "\u5237\u65b0\u5931\u8d25";
-      });
-  }
-  if (logButton) logButton.onclick = refreshLogs;
-  if (clearLogButton) clearLogButton.onclick = function () {
-    if (!window.confirm("\u786e\u5b9a\u6e05\u9664\u5168\u90e8\u65e5\u5fd7\uff1f")) return;
-    if (logStatus) logStatus.textContent = "\u6b63\u5728\u6e05\u9664...";
-    fetch("/logs/clear", { method: "POST", cache: "no-store" })
-      .then(function (response) {
-        if (!response.ok) throw new Error("clear failed");
-        logView.textContent = "\u6682\u65e0\u65e5\u5fd7";
-        if (logStatus) logStatus.textContent = "\u5df2\u6e05\u9664\uff0c\u5171 0 \u6761";
-      })
-      .catch(function () {
-        if (logStatus) logStatus.textContent = "\u6e05\u9664\u5931\u8d25";
-      });
-  };
-  if (logView && location.hash.slice(1) === "logs") refreshLogs();
-
-  var toast = document.createElement("div");
-  toast.className = "toast";
-  document.body.appendChild(toast);
-  var toastTimer = 0;
-  function showBusy(text) {
-    toast.textContent = text;
-    addClass(toast, "show");
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () {
-      removeClass(toast, "show");
-    }, 4500);
-  }
-  function markBusy(element, text) {
-    if (!element || hasClass(element, "busy")) return;
-    element.setAttribute("data-original-text", (element.textContent || "").replace(/^\s+|\s+$/g, ""));
-    addClass(element, "busy");
-    element.setAttribute("aria-busy", "true");
-    element.textContent = text;
-  }
-  document.onclick = function (event) {
-    event = event || window.event;
-    var link = closest(event.target || event.srcElement, "a.btn");
-    if (!link) return;
-    var href = link.getAttribute("href") || "";
-    if (!href || href.charAt(0) === "#" || href.indexOf("javascript:") === 0 || link.target) return;
-    if ((link.getAttribute("onclick") || "").indexOf("confirm") >= 0) return;
-    markBusy(link, "\u5904\u7406\u4e2d...");
-    showBusy("\u5df2\u70b9\u51fb\uff0c\u6b63\u5728\u6267\u884c...");
-  };
-  document.onsubmit = function (event) {
-    event = event || window.event;
-    var form = event.target || event.srcElement;
-    if (!form || hasClass(form, "is-submitting")) return;
-    addClass(form, "is-submitting");
-    var button = form.querySelector("button[type=submit],input[type=submit],.btn");
-    markBusy(button, "\u63d0\u4ea4\u4e2d...");
-    var isUpload = ((form.enctype || "").indexOf("multipart/form-data") >= 0);
-    showBusy(isUpload ? "\u6b63\u5728\u4e0a\u4f20\uff0c\u8bf7\u4e0d\u8981\u65ad\u7535..." : "\u6b63\u5728\u63d0\u4ea4...");
-  };
-
-  function getJson(url, done) {
-    if (!window.XMLHttpRequest) return;
-    var xhr = new XMLHttpRequest();
-    xhr.open("GET", url, true);
-    xhr.onreadystatechange = function () {
-      if (xhr.readyState !== 4 || xhr.status !== 200) return;
-      try {
-        done(JSON.parse(xhr.responseText));
-      } catch (error) {
-      }
-    };
-    xhr.send(null);
-  }
-  var learnState = document.querySelector("[data-rf-learn-state]");
-  var countdown = document.querySelector("[data-rf-countdown]");
-  var pending = document.querySelector("[data-rf-pending]");
-  function updateRfStatus() {
-    if (!learnState || !countdown || !pending) return;
-    getJson("/rf-status?ts=" + Date.now(), function (data) {
-      learnState.textContent = data.learning ? "\u7b49\u5f85\u63a5\u6536" : (data.ready ? "\u5df2\u63a5\u6536\uff0c\u5f85\u4fdd\u5b58" : "\u7a7a\u95f2");
-      countdown.textContent = data.remaining || 0;
-      pending.textContent = data.ready ? (data.value + " / " + data.bits + " bits") : "\u6682\u65e0";
-    });
-  }
-  if (learnState) {
-    updateRfStatus();
-    setInterval(updateRfStatus, 1000);
-  }
-
-  var irLearnState = document.querySelector("[data-ir-learn-state]");
-  var irCountdown = document.querySelector("[data-ir-countdown]");
-  var irPending = document.querySelector("[data-ir-pending]");
-  function updateIrStatus() {
-    if (!irLearnState || !irCountdown || !irPending) return;
-    getJson("/ir-status?ts=" + Date.now(), function (data) {
-      irLearnState.textContent = data.learning ? "\u7b49\u5f85\u63a5\u6536" : (data.ready ? "\u5df2\u63a5\u6536\uff0c\u5f85\u4fdd\u5b58" : "\u7a7a\u95f2");
-      irCountdown.textContent = data.remaining || 0;
-      irPending.textContent = data.ready ? (data.length + " pulses / " + data.frequency + " kHz") : "\u6682\u65e0";
-    });
-  }
-  if (irLearnState) {
-    updateIrStatus();
-    setInterval(updateIrStatus, 1000);
-  }
+  var saved = load("esp-scheme");
+  if (saved) { if (scheme) scheme.value = saved; apply(saved); }
+  if (scheme) scheme.addEventListener("change", function () { store("esp-scheme", scheme.value); apply(scheme.value); });
 })();
 )rawliteral";
+
+// 优先从 LittleFS 提供静态资源；文件缺失时回退到内置精简版。
+void serveAsset(const char* path, const char* contentType, PGM_P fallback) {
+  if (fsReady) {
+    File file = LittleFS.open(path, "r");
+    if (file && !file.isDirectory()) {
+      size_t length = file.size();
+      server.sendHeader(F("Cache-Control"), F("max-age=600"));
+      server.streamFile(file, contentType);
+      file.close();
+      Serial.printf("Asset %s served from LittleFS (%u bytes)\n",
+                    path, static_cast<unsigned>(length));
+      return;
+    }
+    if (file) file.close();
+    Serial.printf("Asset %s missing in LittleFS, using built-in fallback\n", path);
+  } else {
+    Serial.printf("Asset %s: filesystem not ready, using built-in fallback\n", path);
+  }
+  server.send_P(200, contentType, fallback);
+}
 
 void appendPageStart(String& page, const String& title) {
   page += F("<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>");
@@ -2564,7 +2589,21 @@ void sendEscapedChunk(const String& text) {
   yield();
 }
 
+void sendEscapedChunk(const char* text) {
+  String escaped = htmlEscape(text);
+  server.sendContent(escaped);
+  yield();
+}
+
 void sendKv(PGM_P label, const String& value) {
+  sendChunk(PSTR("<div class='kv'><b>"));
+  sendChunk(label);
+  sendChunk(PSTR("</b>"));
+  sendEscapedChunk(value);
+  sendChunk(PSTR("</div>"));
+}
+
+void sendKv(PGM_P label, const char* value) {
   sendChunk(PSTR("<div class='kv'><b>"));
   sendChunk(label);
   sendChunk(PSTR("</b>"));
@@ -2772,7 +2811,7 @@ void sendIrPanelLite() {
 }
 
 void sendLogsPanelLite() {
-  sendChunk(PSTR("<section class='panel active' data-panel='logs'><section class='card'><div class='section-head'><h2>运行日志</h2><div class='actions'><button class='btn secondary' type='button' data-refresh-logs>刷新</button><button class='btn warn' type='button' data-clear-logs>清除</button><a class='btn secondary' href='/logs' target='_blank'>纯文本</a></div></div><div class='muted' data-log-status>最近 "));
+  sendChunk(PSTR("<section class='panel active' data-panel='logs'><section class='card'><div class='section-head'><h2>运行日志</h2><div class='actions'><button class='btn secondary' type='button' data-refresh-logs>刷新</button><button class='btn warn' type='button' data-clear-logs>清除</button><a class='btn secondary' href='/logs' target='_blank'>纯文本</a><a class='btn secondary' href='/logs/file' target='_blank'>已存盘</a></div></div><div class='muted' data-log-status>最近 "));
   sendChunk(String(logLineUsed));
   sendChunk(PSTR(" 条</div><pre class='log-view' data-log-view>"));
   for (uint8_t i = 0; i < logLineUsed; i++) {
@@ -2812,11 +2851,11 @@ void handleRoot() {
 }
 
 void handleAppCss() {
-  server.send_P(200, "text/css; charset=utf-8", APP_CSS);
+  serveAsset("/app.css", "text/css; charset=utf-8", FALLBACK_CSS);
 }
 
 void handleAppJs() {
-  server.send_P(200, "application/javascript; charset=utf-8", APP_JS);
+  serveAsset("/app.js", "application/javascript; charset=utf-8", FALLBACK_JS);
 }
 
 void handleLogs() {
@@ -2835,8 +2874,50 @@ void handleLogsClear() {
   memset(logLines, 0, sizeof(logLines));
   logLineNext = 0;
   logLineUsed = 0;
+#if ENABLE_LOG_PERSIST
+  logPendingLen = 0;
+  if (fsReady) {
+    LittleFS.remove(LOG_FILE_PATH);
+    LittleFS.remove(LOG_FILE_PREV_PATH);
+  }
+#endif
   server.send(204, "text/plain", "");
 }
+
+#if ENABLE_LOG_PERSIST
+// 查看已存盘的日志：先输出上一份(/log.1.txt)，再输出当前份(/log.txt)。
+// 采用分块发送，避免把整个文件读进 RAM。
+void handleLogsFile() {
+  flushLogToFile();
+  if (!fsReady) {
+    server.send(503, "text/plain; charset=utf-8", "文件系统未就绪");
+    return;
+  }
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/plain; charset=utf-8", "");
+
+  const char* paths[2] = {LOG_FILE_PREV_PATH, LOG_FILE_PATH};
+  bool any = false;
+  for (uint8_t i = 0; i < 2; i++) {
+    if (!LittleFS.exists(paths[i])) continue;
+    File file = LittleFS.open(paths[i], "r");
+    if (!file) continue;
+    any = true;
+    char header[64];
+    snprintf(header, sizeof(header), "===== %s (%u bytes) =====\n",
+             paths[i], static_cast<unsigned>(file.size()));
+    server.sendContent(header);
+    server.sendContent(file);
+    file.close();
+    server.sendContent("\n");
+    yield();
+  }
+
+  if (!any) server.sendContent("(暂无已存盘日志)\n");
+  server.sendContent("");
+}
+#endif
 
 void handleRfStatus() {
   unsigned long remaining = 0;
@@ -2902,8 +2983,13 @@ void handleBaiduConfig() {
 }
 
 void handleReboot() {
-  lastMessage = "Reboot requested";
+  setLastMessage("Reboot requested");
+  addLog("Reboot requested by web");
   drawStatus();
+#if ENABLE_LOG_PERSIST
+  // 重启会清空 RAM 日志，这里强制落盘保住现场
+  flushLogToFile();
+#endif
   server.send(200, "text/html; charset=utf-8",
               "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
               "<p>设备正在重启，请等待 10-20 秒后刷新页面。</p>"
@@ -2922,7 +3008,7 @@ void handleIrLearn() {
   memset(learnedIrRaw, 0, sizeof(learnedIrRaw));
   learnDeadline = millis() + 15000UL;
   irrecv.resume();
-  lastMessage = "Learning IR";
+  setLastMessage("Learning IR");
   drawStatus();
   server.sendHeader("Location", "/#ir", true);
   server.send(302, "text/plain", "");
@@ -2961,7 +3047,7 @@ void handleIrSet() {
 
   learnedIrReady = false;
   learnedIrLength = 0;
-  lastMessage = "Saved IR " + String(slot);
+  setLastMessage("Saved IR %u", slot);
   drawStatus();
   server.sendHeader("Location", "/#ir", true);
   server.send(302, "text/plain", "");
@@ -3020,7 +3106,7 @@ void handleIrPresetSave() {
   irSlot.fan = fan;
   saveIrSlots();
 
-  lastMessage = "Saved AC preset " + String(slot);
+  setLastMessage("Saved AC preset %u", slot);
   drawStatus();
   server.sendHeader("Location", "/#ir", true);
   server.send(302, "text/plain", "");
@@ -3046,7 +3132,7 @@ void handleIrClear() {
   if (slot != 0) {
     setDefaultIrSlot(slot - 1);
     saveIrSlots();
-    lastMessage = "Cleared IR " + String(slot);
+    setLastMessage("Cleared IR %u", slot);
     drawStatus();
     server.sendHeader("Location", "/#ir", true);
     server.send(302, "text/plain", "");
@@ -3055,7 +3141,7 @@ void handleIrClear() {
 
   initDefaultIrSlots();
   saveIrSlots();
-  lastMessage = "IR codes cleared";
+  setLastMessage("IR codes cleared");
   drawStatus();
   server.sendHeader("Location", "/#ir", true);
   server.send(302, "text/plain", "");
@@ -3078,7 +3164,7 @@ void handleLearn() {
   }
   learnSlot = slot;
   learnDeadline = millis() + 15000UL;
-  lastMessage = "Learning slot " + String(slot);
+  setLastMessage("Learning slot %u", slot);
   drawStatus();
   server.sendHeader("Location", "/#rf", true);
   server.send(302, "text/plain", "");
@@ -3098,7 +3184,7 @@ void handleSet() {
   code.pulseLength = server.hasArg("pulse") ? server.arg("pulse").toInt() : 350;
   saveRfSlots();
 
-  lastMessage = "Saved slot " + String(slot);
+  setLastMessage("Saved slot %u", slot);
   drawStatus();
   server.sendHeader("Location", "/#rf", true);
   server.send(302, "text/plain", "");
@@ -3124,7 +3210,7 @@ void handleTx() {
          static_cast<unsigned long>(value),
          RF_REPEAT_TRANSMIT,
          static_cast<unsigned long>(elapsed));
-  lastMessage = "TX test " + String(value);
+  setLastMessage("TX test %lu", static_cast<unsigned long>(value));
   drawStatus();
   server.sendHeader("Location", "/#rf", true);
   server.send(302, "text/plain", "");
@@ -3169,7 +3255,7 @@ void handleRfSelfTest() {
     lastReceived = received;
     lastReceivedAt = millis();
     bool matched = received.value == RF_SELF_TEST_VALUE && received.bits == RF_SELF_TEST_BITS;
-    lastMessage = matched ? "RF self-test OK" : "RF self-test got other";
+    setLastMessage("%s", matched ? "RF self-test OK" : "RF self-test got other");
     Serial.printf("RF self-test RX: value=%lu bits=%u protocol=%u pulse=%u matched=%u\n",
                   static_cast<unsigned long>(received.value),
                   received.bits,
@@ -3177,7 +3263,7 @@ void handleRfSelfTest() {
                   received.pulseLength,
                   matched ? 1 : 0);
   } else {
-    lastMessage = "RF self-test no RX";
+    setLastMessage("RF self-test no RX");
     Serial.printf("RF self-test failed: no RX within %lu ms\n",
                   static_cast<unsigned long>(RF_SELF_TEST_WAIT_MS));
   }
@@ -3197,18 +3283,51 @@ void handleClear() {
     settings.codes[i].pulseLength = 350;
   }
   saveSettings();
-  lastMessage = "Codes cleared";
+  setLastMessage("Codes cleared");
   drawStatus();
   server.send(200, "text/plain; charset=utf-8", "已清除所有 433 编码，返回首页重新学习");
 }
 
+// rfSlotState[slot] 仅表示"最后一次通过 HTTP/语音指令请求的状态"。
+// 433 固定码是 toggle 语义，发同一个码开和关都一样，设备无法回读真实灯况，
+// 所以这个状态是"请求状态"而非"实际状态"，仅供 Home Assistant 等外部集成做
+// UI 显示用，不代表灯具真实开关状态。
 void handleSendV2() {
   uint8_t slot = parseSlot();
   if (slot == 0) {
     server.send(400, "text/plain; charset=utf-8", "slot must be 1-6");
     return;
   }
+  // 可选参数 state=on|off：HA 侧显式带上，避免依赖 toggle 语义猜测。
+  if (server.hasArg("state")) {
+    String state = server.arg("state");
+    state.trim();
+    state.toLowerCase();
+    if (state == BLINKER_CMD_ON) {
+      rfSlotState[slot] = true;
+    } else if (state == BLINKER_CMD_OFF) {
+      rfSlotState[slot] = false;
+    } else {
+      // toggle 或未指定：翻转请求状态
+      rfSlotState[slot] = !rfSlotState[slot];
+    }
+  } else {
+    rfSlotState[slot] = !rfSlotState[slot];
+  }
   sendCode(slot - 1);
+}
+
+// 返回各 433 码位的请求状态，供 Home Assistant 实体回读。
+void handleRfStateApi() {
+  String json = F("{\"ok\":true");
+  for (uint8_t i = 1; i <= RF_SLOT_COUNT; i++) {
+    json += F(",\"slot");
+    json += String(i);
+    json += F("\":");
+    json += rfSlotState[i] ? F("true") : F("false");
+  }
+  json += F("}");
+  server.send(200, "application/json; charset=utf-8", json);
 }
 
 void handleLearnV2() {
@@ -3218,7 +3337,7 @@ void handleLearnV2() {
   learnedCodeReady = false;
   learnedCode = {0, 0, 0, 0};
   learnDeadline = millis() + 15000UL;
-  lastMessage = "Learning RF";
+  setLastMessage("Learning RF");
   drawStatus();
   server.sendHeader("Location", "/#rf", true);
   server.send(302, "text/plain", "");
@@ -3261,7 +3380,7 @@ void handleSetV2() {
   if (rfSlot.code.pulseLength == 0) rfSlot.code.pulseLength = 350;
   saveRfSlots();
 
-  lastMessage = "Saved slot " + String(slot);
+  setLastMessage("Saved slot %u", slot);
   drawStatus();
   server.sendHeader("Location", "/#rf", true);
   server.send(302, "text/plain", "");
@@ -3272,7 +3391,7 @@ void handleClearV2() {
   if (slot != 0) {
     setDefaultRfSlot(slot - 1);
     saveRfSlots();
-    lastMessage = "Cleared slot " + String(slot);
+    setLastMessage("Cleared slot %u", slot);
     drawStatus();
     server.sendHeader("Location", "/#rf", true);
     server.send(302, "text/plain", "");
@@ -3281,7 +3400,7 @@ void handleClearV2() {
 
   initDefaultRfSlots();
   saveRfSlots();
-  lastMessage = "Codes cleared";
+  setLastMessage("Codes cleared");
   drawStatus();
   server.sendHeader("Location", "/#rf", true);
   server.send(302, "text/plain", "");
@@ -3312,7 +3431,9 @@ void handleVoiceSave() {
     settings.voiceRfRepeat = normalizedVoiceRfRepeat(settings.voiceRfRepeat);
   }
   saveSettings();
-  lastMessage = auth.length() == 0 ? "Voice disabled" : (baiduRequest ? "Baidu auth saved" : "Voice auth saved");
+  setLastMessage("%s", auth.length() == 0
+                              ? "Voice disabled"
+                              : (baiduRequest ? "Baidu auth saved" : "Voice auth saved"));
   addLog("Voice config saved auth=%u repeat=%u",
          auth.length() > 0 ? 1 : 0,
          normalizedVoiceRfRepeat(settings.voiceRfRepeat));
@@ -3348,11 +3469,19 @@ void aligeniePowerState(const String& state, uint8_t num) {
   if (num >= 1 && num <= VOICE_OUTLET_COUNT) {
     if (num <= 3) {
       sent = transmitSavedSlot(num, "AliGenie");
+      rfSlotState[num] = (state == BLINKER_CMD_ON);
     } else {
       sent = transmitSavedIrSlot(num - 3, "AliGenie");
     }
     voiceOutletState[num] = (state == BLINKER_CMD_ON);
     BlinkerAliGenie.powerState(voiceOutletState[num] ? "on" : "off", num);
+  } else if (num == 0) {
+    // 天猫把多路插座降级为单路时会省略 num，此时按主灯位处理，避免语音完全无效。
+    addLog("AliGenie num=0 fallback to 433 slot 1 state=%s", state.c_str());
+    sent = transmitSavedSlot(1, "AliGenie");
+    rfSlotState[1] = (state == BLINKER_CMD_ON);
+    voiceOutletState[1] = (state == BLINKER_CMD_ON);
+    BlinkerAliGenie.powerState(voiceOutletState[1] ? "on" : "off", 1);
   } else {
     addLog("AliGenie invalid num=%u state=%s", num, state.c_str());
     BlinkerAliGenie.powerState(state, num);
@@ -3387,11 +3516,18 @@ void duerPowerState(const String& state, uint8_t num) {
   if (num >= 1 && num <= VOICE_OUTLET_COUNT) {
     if (num <= 3) {
       transmitSavedSlot(num, "DuerOS");
+      rfSlotState[num] = (state == BLINKER_CMD_ON);
     } else {
       transmitSavedIrSlot(num - 3, "DuerOS");
     }
     voiceOutletState[num] = (state == BLINKER_CMD_ON);
     BlinkerDuerOS.powerState(voiceOutletState[num] ? "on" : "off", num);
+  } else if (num == 0) {
+    addLog("DuerOS num=0 fallback to 433 slot 1 state=%s", state.c_str());
+    transmitSavedSlot(1, "DuerOS");
+    rfSlotState[1] = (state == BLINKER_CMD_ON);
+    voiceOutletState[1] = (state == BLINKER_CMD_ON);
+    BlinkerDuerOS.powerState(voiceOutletState[1] ? "on" : "off", 1);
   } else {
     addLog("DuerOS invalid num=%u state=%s", num, state.c_str());
     BlinkerDuerOS.powerState(state, num);
@@ -3414,9 +3550,95 @@ void duerQuery(int32_t queryCode, uint8_t num) {
   BlinkerDuerOS.print();
 }
 
+// 解析 Blinker 普通组件报文里的 btn-lightN -> 1..N，命中则发射对应 433 码位。
+// 说明：天猫 AliGenie 走 pState + num，由库内 aliParse() 分发；
+// 而 Blinker App 手动点按走 btn-lightN，只能在这里补映射。
+bool parseBtnLightSlot(const char* data, uint8_t& slot) {
+  if (data == nullptr) return false;
+  for (uint8_t i = 1; i <= 9; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "btn-light%u", static_cast<unsigned>(i));
+    if (strstr(data, key) != nullptr) {
+      slot = i;
+      return true;
+    }
+  }
+  return false;
+}
+
 void blinkerDataRead(const String& data) {
   BLINKER_LOG("Blinker data: ", data);
   addLog("Blinker data %s", data.c_str());
+
+  uint8_t slot = 0;
+  if (!parseBtnLightSlot(data.c_str(), slot)) {
+    addLog("Blinker data ignored: no btn-light key");
+    return;
+  }
+
+  if (slot > 3) {
+    addLog("Blinker btn-light%u ignored: only 1-3 map to 433", slot);
+    return;
+  }
+
+  addLog("Blinker btn-light%u -> 433 slot %u", slot, slot);
+  showOledEventLine(5, "Blinker slot " + String(slot));
+  // 组件值 "on"/"off" 仅表示用户按了开关，433 toggle 语义下实际是翻转请求状态
+  if (strstr(data.c_str(), "\"off\"") != nullptr) {
+    rfSlotState[slot] = false;
+  } else {
+    rfSlotState[slot] = !rfSlotState[slot];
+  }
+  transmitSavedSlot(slot, "Blinker");
+}
+
+// mDNS 延迟注册：必须等到 WiFi.status()==WL_CONNECTED 且 WiFi.localIP() 拿到有效
+// 地址后才启动，否则 mDNS 会在无有效 IP 的状态下初始化，导致广播发不出去、
+// esp8266-433.local 无法解析。Blinker 库自身也会启动一个 mDNS responder，
+// 本函数用 mdnsBuiltin 标记避免与它抢同一端口。
+void startMdnsWhenReady() {
+  static bool started = false;
+  static unsigned long lastTryAt = 0;
+  if (started) return;
+
+  unsigned long now = millis();
+  if (now - lastTryAt < MDNS_RETRY_MS) return;
+  lastTryAt = now;
+
+  if (!wifiConnected()) return;
+
+  IPAddress ip = WiFi.localIP();
+  if (ip == IPAddress(0, 0, 0, 0)) return;
+
+  if (MDNS.begin(MDNS_HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    started = true;
+    addLog("mDNS ready ip=%s http://%s.local",
+           ip.toString().c_str(), MDNS_HOSTNAME);
+  } else {
+    addLog("mDNS begin failed, retry in %ums", static_cast<unsigned>(MDNS_RETRY_MS));
+  }
+}
+
+void reportBlinkerLinkState() {
+  static unsigned long lastReportAt = 0;
+  static bool lastLinked = false;
+  static bool firstRun = true;
+
+  unsigned long now = millis();
+  if (!firstRun && now - lastReportAt < BLINKER_LINK_REPORT_MS) return;
+
+  bool linked = Blinker.connected() != 0;
+  if (firstRun || linked != lastLinked) {
+    addLog("Blinker link %s auth_set=%u",
+           linked ? "MQTT_CONNECTED" : "MQTT_LOST",
+           hasBlinkerAuth() ? 1 : 0);
+    showOledEventLine(3, linked ? "Blinker linked" : "Blinker offline");
+    if (linked != lastLinked) lastLinked = linked;
+  }
+
+  lastReportAt = now;
+  firstRun = false;
 }
 
 void setupVoice() {
@@ -3425,6 +3647,9 @@ void setupVoice() {
     return;
   }
 
+  BLINKER_DEBUG.stream(Serial);
+  addLog("Blinker debug enabled");
+
   Blinker.begin(settings.blinkerAuth, settings.wifiSsid, settings.wifiPassword);
   Blinker.attachData(blinkerDataRead);
   BlinkerAliGenie.attachPowerState(aligeniePowerState);
@@ -3432,7 +3657,7 @@ void setupVoice() {
   BlinkerDuerOS.attachPowerState(duerPowerState);
   BlinkerDuerOS.attachQuery(duerQuery);
   voiceStarted = true;
-  lastMessage = "Voice enabled: AliGenie + DuerOS";
+  setLastMessage("Voice enabled: AliGenie + DuerOS");
   addLog("Voice setup started ssid=%s", settings.wifiSsid);
   drawStatus();
 }
@@ -3442,7 +3667,7 @@ bool connectToSavedWifi(unsigned long timeoutMs) {
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(settings.wifiSsid, settings.wifiPassword);
-  lastMessage = "Connecting WiFi";
+  setLastMessage("Connecting WiFi");
   drawStatus();
 
   unsigned long start = millis();
@@ -3451,7 +3676,10 @@ bool connectToSavedWifi(unsigned long timeoutMs) {
   }
 
   if (wifiConnected()) {
-    lastMessage = "WiFi connected";
+    // 注意：这里不要立刻注册 mDNS。WL_CONNECTED 成立时 DHCP 可能还没分配到
+    // 实际 IP，mDNS 会在无有效地址的情况下启动，导致广播不出去、域名无法解析。
+    // 改由 loop() 中的 startMdnsWhenReady() 等待 IP 就绪后再注册。
+    setLastMessage("WiFi connected");
     return true;
   }
 
@@ -3462,7 +3690,7 @@ bool connectToSavedWifi(unsigned long timeoutMs) {
 void startSetupAp() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
-  lastMessage = "Setup AP";
+  setLastMessage("Setup AP");
   drawStatus();
 }
 
@@ -3495,11 +3723,11 @@ void handleWifiSave() {
   if (connectToSavedWifi(WIFI_JOIN_TIMEOUT_MS)) {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
-    lastMessage = "WiFi connected";
+    setLastMessage("WiFi connected");
     updateWorldTimeIfNeeded();
   } else {
     startSetupAp();
-    lastMessage = "WiFi failed";
+    setLastMessage("WiFi failed");
   }
   drawStatus();
 }
@@ -3515,7 +3743,13 @@ void setupWifi() {
 void setup() {
   Serial.begin(115200);
   delay(800);
-  addLog("Boot start chip=%06X", ESP.getChipId());
+  // 每次启动打断一行，便于在持久化日志里区分不同会话。
+  // reset 原因能直接区分「掉电 / 看门狗 / 异常复位 / 软件重启」，配合上方日志可定位崩溃。
+  addLog("===== reboot =====");
+  addLog("Boot start chip=%06X reset=%s heap=%u",
+         ESP.getChipId(),
+         ESP.getResetReason().c_str(),
+         ESP.getFreeHeap());
 
   setupOled();
 
@@ -3533,6 +3767,9 @@ void setup() {
   server.on("/app.js", handleAppJs);
   server.on("/logs", handleLogs);
   server.on("/logs/clear", HTTP_POST, handleLogsClear);
+#if ENABLE_LOG_PERSIST
+  server.on("/logs/file", handleLogsFile);
+#endif
   server.on("/rf-status", handleRfStatus);
   server.on("/ir-status", handleIrStatus);
   server.on("/config", handleConfig);
@@ -3543,6 +3780,7 @@ void setup() {
   server.on("/voice", HTTP_POST, handleVoiceSave);
   server.on("/baidu", HTTP_POST, handleVoiceSave);
   server.on("/send", handleSendV2);
+  server.on("/rf-state", handleRfStateApi);
   server.on("/learn", handleLearnV2);
   server.on("/set", handleSetV2);
   server.on("/tx", handleTx);
@@ -3556,7 +3794,9 @@ void setup() {
 #endif
   server.on("/ir-send", handleIrSend);
   server.on("/ir-clear", handleIrClear);
+#if ENABLE_OTA_UPDATE
   httpUpdater.setup(&server, "/update", "admin", AP_PASSWORD);
+#endif
   server.begin();
   addLog("HTTP server started ip=%s voice=%u rfRepeat=%u voiceRfRepeat=%u",
          deviceIP().toString().c_str(),
@@ -3581,7 +3821,17 @@ void loop() {
   server.handleClient();
   if (voiceStarted) {
     Blinker.run();
+    reportBlinkerLinkState();
   }
+  startMdnsWhenReady();
+
+#if ENABLE_LOG_PERSIST
+  // 定时把攒下的日志追加到 LittleFS，避免逐条写入磨损 flash
+  if (logPendingLen > 0 && millis() - lastLogFlushAt >= LOG_FLUSH_INTERVAL_MS) {
+    lastLogFlushAt = millis();
+    flushLogToFile();
+  }
+#endif
 
   updateOledWifiStatusIfChanged();
   updateWorldTimeIfNeeded();
@@ -3596,19 +3846,19 @@ void loop() {
 
   if (rfLearning && millis() > learnDeadline) {
     rfLearning = false;
-    lastMessage = learnedCodeReady ? "RF learned" : "Learn timeout";
+    setLastMessage("%s", learnedCodeReady ? "RF learned" : "Learn timeout");
     drawStatus();
   }
 
   if (irLearning && millis() > learnDeadline) {
     irLearning = false;
-    lastMessage = learnedIrReady ? "IR learned" : "IR learn timeout";
+    setLastMessage("%s", learnedIrReady ? "IR learned" : "IR learn timeout");
     drawStatus();
   }
 
   if (learnSlot != 0 && millis() > learnDeadline) {
     learnSlot = 0;
-    lastMessage = "Learn timeout";
+    setLastMessage("Learn timeout");
     drawStatus();
   }
 
@@ -3622,7 +3872,7 @@ void loop() {
     if (received.value != 0) {
       lastReceived = received;
       lastReceivedAt = millis();
-      lastMessage = "RX " + String(received.value);
+      setLastMessage("RX %lu", static_cast<unsigned long>(received.value));
       Serial.printf("Received: value=%lu bits=%u protocol=%u pulse=%u\n",
                     static_cast<unsigned long>(received.value), received.bits,
                     received.protocol, received.pulseLength);
@@ -3631,11 +3881,11 @@ void loop() {
         learnedCode = received;
         learnedCodeReady = true;
         rfLearning = false;
-        lastMessage = "RF learned " + String(received.value);
+        setLastMessage("RF learned %lu", static_cast<unsigned long>(received.value));
       } else if (learnSlot != 0) {
         rfSlots[learnSlot - 1].code = received;
         saveRfSlots();
-        lastMessage = "Learned slot " + String(learnSlot);
+        setLastMessage("Learned slot %u", learnSlot);
         learnSlot = 0;
       }
       drawStatus();
@@ -3665,7 +3915,7 @@ void loop() {
         learnedIrFrequency = IR_DEFAULT_FREQUENCY_KHZ;
         learnedIrReady = true;
         irLearning = false;
-        lastMessage = "IR learned " + String(copyLength);
+        setLastMessage("IR learned %u", copyLength);
         drawStatus();
       }
       delete[] rawArray;

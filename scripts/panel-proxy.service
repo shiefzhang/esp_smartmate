@@ -1,0 +1,16 @@
+[Unit]
+Description=Home Panel proxy (HA + mihomo)
+After=network-online.target mihomo.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/orangepi/docker/panel
+ExecStart=/usr/bin/python3 /home/orangepi/docker/panel/panel_proxy.py
+Restart=on-failure
+RestartSec=5
+Environment="NO_PROXY=localhost,127.0.0.1,192.168.0.0/16"
+
+[Install]
+WantedBy=multi-user.target
