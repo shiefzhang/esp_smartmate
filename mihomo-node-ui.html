@@ -121,6 +121,34 @@
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--line); margin-right: 6px; }
   .dot.on { background: var(--green); }
   .dot.off { background: var(--sub); }
+  /* ===== 历史用量 ===== */
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tabs button { padding: 4px 12px; font-size: 12px; }
+  .nav {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 12px;
+  }
+  .nav-title {
+    flex: 1; text-align: center; font-size: 14px; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .nav button { flex: none; font-size: 12px; padding: 5px 12px; }
+  .tbl {
+    margin-top: 12px; max-height: 300px; overflow-y: auto;
+    border: 1px solid var(--line); border-radius: 6px;
+    background: var(--card);
+  }
+  .tbl::-webkit-scrollbar { width: 8px; }
+  .tbl::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+  .tbl::-webkit-scrollbar-track { background: transparent; }
+  .trow {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 6px 12px; font-size: 12px;
+    border-bottom: 1px solid var(--line);
+    color: var(--sub);
+  }
+  .trow:last-child { border-bottom: none; }
+  .trow b { color: var(--text); font-variant-numeric: tabular-nums; }
   .msg { margin: 12px 0; padding: 9px 13px; border-radius: 6px; font-size: 13px; display: none; }
   .msg.ok { display: block; background: #dafbe1; color: var(--green); }
   .msg.err { display: block; background: #ffebe9; color: var(--red); }
@@ -158,6 +186,16 @@
   </div>
   <div class="cards" id="deviceCards">
     <div class="card"><div class="sub">加载中…</div></div>
+  </div>
+</section>
+
+<section class="panel" id="energy">
+  <div class="panel-head">
+    <span class="panel-title">空调历史用量</span>
+    <button onclick="refreshEnergy()">刷新</button>
+  </div>
+  <div class="card" id="energyBox">
+    <div class="sub">加载中…</div>
   </div>
 </section>
 
@@ -305,6 +343,261 @@ async function toggleCeiling() {
     show('控制失败：' + e.message, false);
     if (btn) btn.disabled = false;
   }
+}
+
+// ===== 历史用量（读 HA recorder 的统计聚合）=====
+let ENERGY = null;
+let ENERGY_TAB = 'week';
+// 每个视图各自记住翻到第几期（0 = 最新）
+let ENERGY_CURSOR = { day: 0, week: 0, month: 0, year: 0 };
+
+async function refreshEnergy() {
+  try {
+    const r = await fetch('/energy');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    ENERGY = await r.json();
+    renderEnergy();
+  } catch (e) {
+    const box = document.getElementById('energyBox');
+    if (box) box.innerHTML = '<div class="sub">历史数据加载失败：' + esc(e.message) + '</div>';
+  }
+}
+
+// 取当前视图下的周期列表（按时间倒序，最新在前）
+function periodList(tab) {
+  if (!ENERGY) return [];
+  const src = ENERGY[tab] || {};
+  return Object.keys(src).sort().reverse().map(k => ({ k: k, v: src[k] }));
+}
+
+// 上一周期 / 下一周期
+function stepPeriod(delta) {
+  const list = periodList(ENERGY_TAB);
+  const cur = ENERGY_CURSOR[ENERGY_TAB] || 0;
+  // 列表是倒序的（index 0 = 最新），所以「上一周期」= 更早 = index 变大
+  const next = cur - delta;
+  if (next < 0 || next >= list.length) return;
+  ENERGY_CURSOR[ENERGY_TAB] = next;
+  renderEnergy();
+}
+
+function barChart(entries, opts) {
+  opts = opts || {};
+  if (!entries.length) return '<div class="sub">暂无数据</div>';
+  const max = Math.max.apply(null, entries.map(e => e.v)) || 1;
+  const w = 640, h = 190, pad = 30, gap = 6;
+  const labelH = 34, valueH = 16;
+  const bh = h - labelH - valueH;
+  const bw = Math.max(6, (w - pad * 2) / entries.length - gap);
+  let svg = '<svg viewBox="0 0 ' + w + ' ' + h + '" width="100%" height="' + h +
+    '" preserveAspectRatio="xMidYMid meet" style="max-width:100%;display:block">';
+
+  // 网格线（3 条）
+  for (let g = 0; g <= 2; g++) {
+    const gy = valueH + (bh * g) / 2;
+    svg += '<line x1="' + pad + '" y1="' + gy + '" x2="' + (w - 6) +
+      '" y2="' + gy + '" stroke="var(--line)" stroke-width="1" opacity="0.6"/>';
+    svg += '<text x="' + (pad - 4) + '" y="' + (gy + 3) + '" text-anchor="end" ' +
+      'font-size="9" fill="var(--sub)">' + (max * (1 - g / 2)).toFixed(1) + '</text>';
+  }
+  // 底线
+  svg += '<line x1="' + pad + '" y1="' + (valueH + bh) + '" x2="' + (w - 6) +
+    '" y2="' + (valueH + bh) + '" stroke="var(--line)" stroke-width="1"/>';
+
+  entries.forEach((e, i) => {
+    const x = pad + i * (bw + gap);
+    const bh2 = Math.max(2, (e.v / max) * bh);
+    const y = valueH + bh - bh2;
+    svg += '<rect x="' + x + '" y="' + y + '" width="' + bw + '" height="' + bh2 +
+      '" rx="2" fill="var(--blue)" opacity="0.85"><title>' +
+      esc(e.k) + ': ' + e.v.toFixed(1) + ' kWh</title></rect>';
+    // 柱顶数值（1 位小数）
+    svg += '<text x="' + (x + bw / 2) + '" y="' + (y - 4) + '" text-anchor="middle" ' +
+      'font-size="10" fill="var(--text)" font-weight="600">' + e.v.toFixed(1) + '</text>';
+  });
+
+  // X 轴标签：条目少时全标，条目多时抽稀（保证不重叠）
+  const maxLabels = Math.max(2, Math.floor((w - pad * 2) / 56));
+  const step = Math.max(1, Math.ceil(entries.length / maxLabels));
+  entries.forEach((e, i) => {
+    if (i % step !== 0 && i !== entries.length - 1) return;
+    const x = pad + i * (bw + gap) + bw / 2;
+    const label = e.k.length > 9 ? e.k.slice(-9) : e.k;
+    svg += '<text x="' + x + '" y="' + (valueH + bh + 15) + '" text-anchor="middle" ' +
+      'font-size="10" fill="var(--sub)">' + esc(label) + '</text>';
+  });
+
+  svg += '<text x="' + (w - 6) + '" y="12" text-anchor="end" font-size="10" ' +
+    'fill="var(--sub)">单位 kWh</text>';
+  svg += '</svg>';
+  return svg;
+}
+
+// 周期标题：日 -> 2026-10-21；周 -> 2026-W43（含起止日）；月 -> 2026-10；年 -> 2026
+function periodTitle(tab, key) {
+  if (tab === 'day') return key;
+  if (tab === 'month') {
+    const [y, m] = key.split('-');
+    return y + ' 年 ' + parseInt(m, 10) + ' 月';
+  }
+  if (tab === 'year') return key + ' 年';
+  if (tab === 'week') {
+    const m = key.match(/^(\d+)-W(\d+)$/);
+    if (!m) return key;
+    const year = parseInt(m[1], 10), week = parseInt(m[2], 10);
+    // ISO 周：周一为一周开始
+    const jan4 = new Date(Date.UTC(year, 0, 4));
+    const dayOfWeek = (jan4.getUTCDay() + 6) % 7;
+    const monday = new Date(jan4);
+    monday.setUTCDate(jan4.getUTCDate() - dayOfWeek + (week - 1) * 7);
+    const sunday = new Date(monday);
+    sunday.setUTCDate(monday.getUTCDate() + 6);
+    const fmt = d => d.getUTCMonth() + 1 + '/' + d.getUTCDate();
+    return year + ' 年第 ' + week + ' 周（' + fmt(monday) + ' ~ ' + fmt(sunday) + '）';
+  }
+  return key;
+}
+
+function renderEnergy() {
+  const box = document.getElementById('energyBox');
+  if (!box || !ENERGY) return;
+  const tabs = [['week', '周'], ['month', '月'], ['year', '年'], ['day', '日']];
+  const list = periodList(ENERGY_TAB);
+  const cursor = Math.max(0, Math.min(ENERGY_CURSOR[ENERGY_TAB] || 0, Math.max(0, list.length - 1)));
+  ENERGY_CURSOR[ENERGY_TAB] = cursor;
+  const current = list[cursor];
+
+  let html = '<div class="tabs">';
+  for (const [key, label] of tabs) {
+    html += '<button class="' + (ENERGY_TAB === key ? 'primary' : '') +
+      '" onclick="setEnergyTab(\'' + key + '\')">' + label + '</button>';
+  }
+  html += '</div>';
+
+  if (!current) {
+    box.innerHTML = html + '<div class="sub">暂无数据</div>';
+    return;
+  }
+
+  // 周期导航
+  html += '<div class="nav">';
+  html += '<button onclick="stepPeriod(-1)"' + (cursor >= list.length - 1 ? ' disabled' : '') +
+    '>◀ 上一周期</button>';
+  html += '<span class="nav-title">' + esc(periodTitle(ENERGY_TAB, current.k)) + '</span>';
+  html += '<button onclick="stepPeriod(1)"' + (cursor <= 0 ? ' disabled' : '') +
+    '>下一周期 ▶</button>';
+  html += '</div>';
+
+  if (ENERGY.range) {
+    html += '<div class="sub" style="margin-bottom:10px">数据范围 ' +
+      esc(ENERGY.range[0]) + ' ~ ' + esc(ENERGY.range[1]) +
+      '（共 ' + ENERGY.days + ' 天）</div>';
+  }
+
+  // 图表内容：随视图变化
+  if (ENERGY_TAB === 'day') {
+    // 日视图：该天的 24 小时曲线
+    const hv = (ENERGY.hourly || {})[current.k] || [];
+    const entries = [];
+    for (let h = 0; h < 24; h++) {
+      entries.push({ k: String(h).padStart(2, '0') + ':00', v: hv[h] === null || hv[h] === undefined ? 0 : hv[h] });
+    }
+    html += barChart(entries);
+    html += '<div class="sub" style="margin-top:6px">当日合计 ' +
+      current.v.toFixed(1) + ' kWh（柱为该时刻累计读数）</div>';
+  } else if (ENERGY_TAB === 'month') {
+    // 月视图：该月每天一根柱
+    const entries = Object.keys(ENERGY.daily || {})
+      .filter(d => d.indexOf(current.k) === 0)
+      .sort()
+      .map(d => ({ k: d.slice(8), v: ENERGY.daily[d] }));
+    html += barChart(entries);
+  } else if (ENERGY_TAB === 'year') {
+    // 年视图：该年每月一根柱
+    const m = ENERGY.month || {};
+    const entries = Object.keys(m)
+      .filter(k => k.indexOf(current.k) === 0)
+      .sort()
+      .map(k => ({ k: k.slice(5) + '月', v: m[k] }));
+    html += barChart(entries);
+  } else {
+    // 周视图：该周每天一根柱
+    const iso = current.k.match(/^(\d+)-W(\d+)$/);
+    const entries = [];
+    if (iso) {
+      const year = parseInt(iso[1], 10), week = parseInt(iso[2], 10);
+      const jan4 = new Date(Date.UTC(year, 0, 4));
+      const dow = (jan4.getUTCDay() + 6) % 7;
+      const mon = new Date(jan4);
+      mon.setUTCDate(jan4.getUTCDate() - dow + (week - 1) * 7);
+      const names = ['一', '二', '三', '四', '五', '六', '日'];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(mon);
+        d.setUTCDate(mon.getUTCDate() + i);
+        const key = d.getUTCFullYear() + '-' +
+          String(d.getUTCMonth() + 1).padStart(2, '0') + '-' +
+          String(d.getUTCDate()).padStart(2, '0');
+        const v = (ENERGY.daily || {})[key];
+        entries.push({
+          k: names[i] + ' ' + (d.getUTCMonth() + 1) + '/' + d.getUTCDate(),
+          v: v === undefined ? 0 : v,
+        });
+      }
+    }
+    html += barChart(entries);
+  }
+
+  // 表格：当前周期的明细
+  const rows = [];
+  if (ENERGY_TAB === 'day') {
+    const hv = (ENERGY.hourly || {})[current.k] || [];
+    for (let h = 0; h < 24; h++) {
+      if (hv[h] === null || hv[h] === undefined) continue;
+      rows.push({ k: String(h).padStart(2, '0') + ':00', v: hv[h] });
+    }
+  } else if (ENERGY_TAB === 'week') {
+    const iso = current.k.match(/^(\d+)-W(\d+)$/);
+    if (iso) {
+      const year = parseInt(iso[1], 10), week = parseInt(iso[2], 10);
+      const jan4 = new Date(Date.UTC(year, 0, 4));
+      const dow = (jan4.getUTCDay() + 6) % 7;
+      const mon = new Date(jan4);
+      mon.setUTCDate(jan4.getUTCDate() - dow + (week - 1) * 7);
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(mon);
+        d.setUTCDate(mon.getUTCDate() + i);
+        const key = d.getUTCFullYear() + '-' +
+          String(d.getUTCMonth() + 1).padStart(2, '0') + '-' +
+          String(d.getUTCDate()).padStart(2, '0');
+        const v = (ENERGY.daily || {})[key];
+        if (v === undefined) continue;
+        rows.push({ k: key, v: v });
+      }
+    }
+  } else if (ENERGY_TAB === 'month') {
+    for (const d of Object.keys(ENERGY.daily || {}).sort()) {
+      if (d.indexOf(current.k) !== 0) continue;
+      rows.push({ k: d, v: ENERGY.daily[d] });
+    }
+  } else {
+    for (const k of Object.keys(ENERGY.month || {}).sort()) {
+      if (k.indexOf(current.k) !== 0) continue;
+      rows.push({ k: k, v: ENERGY.month[k] });
+    }
+  }
+
+  html += '<div class="tbl">';
+  for (const e of rows) {
+    html += '<div class="trow"><span>' + esc(e.k) + '</span><b>' +
+      e.v.toFixed(1) + ' kWh</b></div>';
+  }
+  html += '</div>';
+  box.innerHTML = html;
+}
+
+function setEnergyTab(t) {
+  ENERGY_TAB = t;
+  renderEnergy();
 }
 
 
@@ -482,7 +775,9 @@ async function testAll() {
 
 (async () => {
   refreshDevices();
+  refreshEnergy();
   setInterval(refreshDevices, 15000);
+  setInterval(refreshEnergy, 60000);
   try {
     DATA = await load();
     render();

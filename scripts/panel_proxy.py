@@ -15,6 +15,7 @@
   GET  /ha/states            -> HA 全部实体
   GET  /ha/states/<id>       -> HA 单个实体
   POST /ha/services/<domain>/<service> -> HA 调用服务
+  GET  /energy               -> 空调电量周/月/年聚合（读 HA recorder 的 SQLite）
   ANY  /mihomo/<path>        -> mihomo REST API（自动带 secret）
 
 部署到 Orange Pi（armv7）：
@@ -28,6 +29,7 @@
 """
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -134,6 +136,9 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/mihomo/"):
             return self._mihomo(path[len("/mihomo"):])
 
+        if path == "/energy":
+            return self._energy()
+
         return self._json(404, {"error": "no route: " + path})
 
     def do_POST(self):
@@ -169,6 +174,22 @@ class Handler(BaseHTTPRequestHandler):
             "Authorization": "Bearer " + _secrets["ha_token"],
             "Content-Type": "application/json",
         }
+
+    def _energy(self):
+        """空调电量周/月/年聚合：调 energy_stats.py 读 HA recorder 的 SQLite"""
+        script = os.path.join(BASE_DIR, "energy_stats.py")
+        if not os.path.isfile(script):
+            return self._json(404, {"error": "energy_stats.py 未部署"})
+        try:
+            proc = subprocess.run(
+                [sys.executable, script], capture_output=True, timeout=60)
+            if proc.returncode != 0:
+                return self._json(500, {"error": proc.stderr.decode("utf-8", "ignore")[:400]})
+            return self._send(200, proc.stdout)
+        except subprocess.TimeoutExpired:
+            return self._json(504, {"error": "查询超时"})
+        except Exception as e:
+            return self._json(500, {"error": str(e)})
 
     def _mihomo(self, path, method="GET", body=None):
         secret = _secrets.get("mihomo_secret", "")
